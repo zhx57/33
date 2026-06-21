@@ -89,6 +89,7 @@ export default defineNuxtConfig({
         '/accounts': { ssr: false },
         '/admin/user': { ssr: false },
         '/admin/system': { ssr: false },
+        '/plugin/**': { ssr: false },
         ...proxyRouteRules
     },
 

@@ -766,7 +766,7 @@ onMounted(() => {
             </template>
             <template #container>
                 <div>
-                    <template v-if="!isAdmin && !['', '0', undefined].includes(accountInfo?.system_settings?.bduss_num) && Number(accountInfo?.system_settings?.bduss_num || -1) > Object.keys(pidNameKV).length">
+                    <template v-if="!isAdmin && !['', '0', undefined].includes(accountInfo?.system_settings?.bduss_num) && Object.keys(pidNameKV).length >= Number(accountInfo?.system_settings?.bduss_num)">
                         无法添加更多账号，请删除一些账号再试</template
                     >
                     <template v-else>
