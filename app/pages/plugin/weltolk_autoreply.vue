@@ -38,6 +38,9 @@ const tasksList = ref<
     }[]
 >([])
 
+const editMode = ref<boolean>(false)
+const editingTaskId = ref<number>(0)
+
 const taskToAdd = ref<{
     pid: number
     fname: string
@@ -49,6 +52,7 @@ const taskToAdd = ref<{
     reply_target: string
     allow_replied: boolean
     match_keywords: string
+    enabled: boolean
 }>({
     pid: 0,
     fname: '',
@@ -59,7 +63,8 @@ const taskToAdd = ref<{
     trigger_mode: 'new_floor',
     reply_target: 'floor',
     allow_replied: false,
-    match_keywords: ''
+    match_keywords: '',
+    enabled: true
 })
 
 const testForm = ref<{
@@ -83,6 +88,27 @@ const testForm = ref<{
 })
 
 const testResult = ref<string>('')
+
+const helpModalKey = ref<string>('')
+const helpModalVisible = ref<boolean>(false)
+
+const helpTexts: Record<string, string> = {
+    interval: '回帖间隔\n两次自动回帖之间至少要等多久（单位：秒）。\n举例：填 300，就是回完一帖后，至少等 5 分钟才会回下一帖。\n建议：别设太短，贴吧有频率限制，太容易被封号。',
+    probability: '回帖概率\n到了该回帖的时候，实际去回帖的几率。\n举例：填 50，就是每次有一半的可能回帖，一半的可能啥也不干。\n填 100 就是每次都回。想降低被发现的风险，可以调低一点。',
+    trigger: '触发模式 — 决定机器人什么时候回帖\n新楼层即回复：监控指定帖子，有新楼层时自动回复，适合跟帖互动。\n关键词匹配回复：监控指定帖子，只有楼层内容命中关键词才回复，适合问答、提醒和定向互动。',
+    keywords: '匹配关键词\n每行写一个关键词，命中任意一个就算匹配。\n用于匹配楼层内容，命中后可在回复内容中使用 {username} 代入楼层用户名。\n举例：\n求助\n怎么弄\n报错',
+    reply_target: '回复目标\n主楼层回复：直接回在帖子里，大家都能看到。\n楼中楼回复：在别人的楼层里回复，只有那层楼里的人能看到。需要关键词模式。',
+    allow_replied: '允许回复已回复过的楼层\n打开后，每次都会重新扫描所有楼层（包括以前回复过的），可能会重复回同一层。\n默认关闭，只回复新楼层。',
+    content: '回复内容怎么写\n支持用花括号变量自动替换：\n{floor} — 当前回帖数\n{time} — 当前时间\n{date} — 当前日期\n{tid} — 帖子 ID\n{username} — 楼层用户名（只在关键词模式下有用）\n举例：第{floor}楼打卡！今天是{date}',
+    fname: '贴吧名称\n就是目标贴吧的名字，不是网址。\n对的：天堂鸡汤\n错的：https://tieba.baidu.com/f?kw=天堂鸡汤\n打开贴吧页面，顶上看那个吧名就是。',
+    tid: '帖子 ID\n帖子的纯数字编号，从浏览器地址栏就能看到。\n举例：链接是 https://tieba.baidu.com/p/12345678，那 ID 就是 12345678',
+    pid: '发帖账号\n选一个你绑定了的百度贴吧账号，机器就用这个号去回帖。\n如果这里没得选，说明你还没绑定账号，去账号管理绑定一下。'
+}
+
+const showHelp = (key: string) => {
+    helpModalKey.value = key
+    helpModalVisible.value = true
+}
 
 const updateTasksSwitch = () => {
     Request(store.basePath + '/plugins/weltolk_autoreply/switch', {
@@ -126,11 +152,30 @@ const getTasksList = () => {
         })
 }
 
-const addTask = () => {
+const resetForm = () => {
+    editMode.value = false
+    editingTaskId.value = 0
+    taskToAdd.value = {
+        pid: 0,
+        fname: '',
+        tid: '',
+        reply_content: '',
+        reply_interval: 300,
+        reply_probability: 100,
+        trigger_mode: 'new_floor',
+        reply_target: 'floor',
+        allow_replied: false,
+        match_keywords: '',
+        enabled: true
+    }
+}
+
+const addTask = (enabledOverride?: number) => {
     if (!Object.keys(pidNameKV.value).includes(taskToAdd.value.pid.toString())) {
         Notice('请选择百度账号', 'error')
         return
     }
+    const enabled = enabledOverride !== undefined ? enabledOverride : (taskToAdd.value.enabled ? 1 : 0)
     Request(store.basePath + '/plugins/weltolk_autoreply/list', {
         headers: {
             Authorization: store.authorization,
@@ -148,7 +193,7 @@ const addTask = () => {
             reply_target: taskToAdd.value.reply_target,
             allow_replied: taskToAdd.value.allow_replied ? '1' : '0',
             match_keywords: taskToAdd.value.match_keywords,
-            enabled: '1'
+            enabled: enabled.toString()
         }).toString()
     }).then((res) => {
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
@@ -157,18 +202,60 @@ const addTask = () => {
         }
         Notice('添加成功', 'success')
         getTasksList()
-        taskToAdd.value = {
-            pid: 0,
-            fname: '',
-            tid: '',
-            reply_content: '',
-            reply_interval: 300,
-            reply_probability: 100,
-            trigger_mode: 'new_floor',
-            reply_target: 'floor',
-            allow_replied: false,
-            match_keywords: ''
+        resetForm()
+    })
+}
+
+const editTask = (task: (typeof tasksList.value)[0]) => {
+    editMode.value = true
+    editingTaskId.value = task.id
+    taskToAdd.value = {
+        pid: task.pid,
+        fname: task.fname,
+        tid: task.tid.toString(),
+        reply_content: task.reply_content,
+        reply_interval: task.reply_interval,
+        reply_probability: task.reply_probability,
+        trigger_mode: task.trigger_mode || 'new_floor',
+        reply_target: task.reply_target || 'floor',
+        allow_replied: task.allow_replied === 1,
+        match_keywords: task.match_keywords || '',
+        enabled: task.enabled === 1
+    }
+}
+
+const saveEditTask = () => {
+    if (!Object.keys(pidNameKV.value).includes(taskToAdd.value.pid.toString())) {
+        Notice('请选择百度账号', 'error')
+        return
+    }
+    Request(store.basePath + '/plugins/weltolk_autoreply/list/' + editingTaskId.value, {
+        headers: {
+            Authorization: store.authorization,
+            'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        method: 'PUT',
+        body: new URLSearchParams({
+            pid: taskToAdd.value.pid.toString(),
+            fname: taskToAdd.value.fname,
+            tid: taskToAdd.value.tid,
+            reply_content: taskToAdd.value.reply_content,
+            reply_interval: taskToAdd.value.reply_interval.toString(),
+            reply_probability: taskToAdd.value.reply_probability.toString(),
+            trigger_mode: taskToAdd.value.trigger_mode,
+            reply_target: taskToAdd.value.reply_target,
+            allow_replied: taskToAdd.value.allow_replied ? '1' : '0',
+            match_keywords: taskToAdd.value.match_keywords,
+            enabled: taskToAdd.value.enabled ? '1' : '0'
+        }).toString()
+    }).then((res) => {
+        if (res.code !== 200) {
+            Notice(res.message, 'error')
+            return
         }
+        Notice('保存成功', 'success')
+        getTasksList()
+        resetForm()
     })
 }
 
@@ -292,6 +379,7 @@ const parseLogs = (log_: string = '') => {
             }
         })
         .filter((x) => x)
+        .slice(0, 200)
         .reverse()
 }
 
@@ -329,6 +417,24 @@ const statusText = (status: string) => {
             return '验证码'
         default:
             return status || '未执行'
+    }
+}
+
+const taskStatusDisplay = (task: (typeof tasksList.value)[0]) => {
+    if (task.enabled === 1) {
+        if (task.last_status === 'error') {
+            return { text: '异常', class: 'text-yellow-500' }
+        } else if (task.last_status === 'vcode') {
+            return { text: '需验证码', class: 'text-yellow-500' }
+        } else {
+            return { text: '运行中', class: 'text-green-500' }
+        }
+    } else {
+        if (task.last_status === 'error') {
+            return { text: '失败已停用', class: 'text-red-500' }
+        } else {
+            return { text: '已暂停', class: 'text-gray-500' }
+        }
     }
 }
 
@@ -389,63 +495,94 @@ onMounted(() => {
         <p v-show="tasksList.length >= limit" class="text-sm">注：任务数已达到或超出上限</p>
 
         <div class="my-5 grid grid-cols-6 gap-2 max-w-[48em]">
-            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" title="添加自动回帖任务" v-show="tasksList.length < limit">
+            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" :title="editMode ? '编辑自动回帖任务' : '添加自动回帖任务'" v-show="tasksList.length < limit || editMode">
                 <template #default>
-                    <button class="w-full rounded-2xl border-2 border-gray-300 hover:bg-gray-300 px-4 py-1 hover:text-black transition-colors">添加任务</button>
+                    <button class="w-full rounded-2xl border-2 border-gray-300 hover:bg-gray-300 px-4 py-1 hover:text-black transition-colors">{{ editMode ? '编辑任务' : '添加任务' }}</button>
                 </template>
                 <template #container>
-                    <div class="my-3">
-                        <label>百度账号</label>
-                        <select v-model="taskToAdd.pid" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
-                            <option value="0">请选择</option>
-                            <option v-for="(name, pid) in pidNameKV" :key="pid" :value="pid">{{ name }}</option>
-                        </select>
-                    </div>
-                    <div class="my-3">
-                        <label>贴吧名称</label>
-                        <input type="text" v-model="taskToAdd.fname" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="贴吧名（不带末尾吧字）" />
-                    </div>
-                    <div class="my-3">
-                        <label>帖子ID</label>
-                        <input type="number" v-model="taskToAdd.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
-                    </div>
-                    <div class="my-3">
-                        <label>回复内容</label>
-                        <textarea v-model="taskToAdd.reply_content" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="3" placeholder="支持变量：{floor} {time} {date} {tid} {username}"></textarea>
-                    </div>
-                    <div class="my-3">
-                        <label>触发模式</label>
-                        <select v-model="taskToAdd.trigger_mode" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
-                            <option value="new_floor">新楼层</option>
-                            <option value="keyword">关键词匹配</option>
-                        </select>
-                    </div>
-                    <div class="my-3" v-show="taskToAdd.trigger_mode === 'keyword'">
-                        <label>匹配关键词（一行一个）</label>
-                        <textarea v-model="taskToAdd.match_keywords" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="3" placeholder="每行一个关键词"></textarea>
-                    </div>
-                    <div class="my-3">
-                        <label>回复目标</label>
-                        <select v-model="taskToAdd.reply_target" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
-                            <option value="floor">回复楼层</option>
-                            <option value="subpost">楼中楼</option>
-                        </select>
-                    </div>
-                    <div class="my-3 flex items-center gap-2">
-                        <input type="checkbox" v-model="taskToAdd.allow_replied" id="allow-replied-add" class="form-checkbox" />
-                        <label for="allow-replied-add">允许重复回复已回复过的楼层</label>
-                    </div>
-                    <div class="my-3 flex gap-3">
-                        <div class="grow">
-                            <label>回复间隔（秒）</label>
-                            <input type="number" v-model="taskToAdd.reply_interval" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" />
-                        </div>
-                        <div class="grow">
-                            <label>回复概率（%）</label>
-                            <input type="number" v-model="taskToAdd.reply_probability" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="1" max="100" />
+                    <!-- 分区 1：选择发帖账号 -->
+                    <div class="border-b border-gray-400 dark:border-gray-600 pb-3 mb-3">
+                        <h6 class="font-bold mb-2">1. 选择发帖账号</h6>
+                        <div class="my-3">
+                            <label class="flex items-center gap-1">发帖账号 <button @click="showHelp('pid')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <select v-model.number="taskToAdd.pid" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
+                                <option :value="0">请选择</option>
+                                <option v-for="(name, pid) in pidNameKV" :key="pid" :value="Number(pid)">{{ name }}</option>
+                            </select>
                         </div>
                     </div>
-                    <button class="px-3 py-1 rounded-lg my-2 bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 text-gray-100 transition-colors" @click="addTask">保存</button>
+
+                    <!-- 分区 2：目标帖子 -->
+                    <div class="border-b border-gray-400 dark:border-gray-600 pb-3 mb-3">
+                        <h6 class="font-bold mb-2">2. 目标帖子</h6>
+                        <div class="my-3">
+                            <label class="flex items-center gap-1">贴吧名称 <button @click="showHelp('fname')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <input type="text" v-model="taskToAdd.fname" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="贴吧名（不带末尾吧字）" />
+                        </div>
+                        <div class="my-3">
+                            <label class="flex items-center gap-1">帖子ID <button @click="showHelp('tid')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <input type="number" v-model="taskToAdd.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
+                        </div>
+                    </div>
+
+                    <!-- 分区 3：回复内容 -->
+                    <div class="border-b border-gray-400 dark:border-gray-600 pb-3 mb-3">
+                        <h6 class="font-bold mb-2">3. 回复内容</h6>
+                        <div class="my-3">
+                            <label class="flex items-center gap-1">回帖内容 <button @click="showHelp('content')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <textarea v-model="taskToAdd.reply_content" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="3" placeholder="支持变量：{floor} {time} {date} {tid} {username}"></textarea>
+                        </div>
+                    </div>
+
+                    <!-- 分区 4：自动执行规则 -->
+                    <div class="pb-3 mb-3">
+                        <h6 class="font-bold mb-2">4. 自动执行规则</h6>
+                        <div class="my-3 flex gap-3">
+                            <div class="grow">
+                                <label class="flex items-center gap-1">回复间隔（秒） <button @click="showHelp('interval')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                                <input type="number" v-model="taskToAdd.reply_interval" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" />
+                            </div>
+                            <div class="grow">
+                                <label class="flex items-center gap-1">回复概率（%） <button @click="showHelp('probability')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                                <input type="number" v-model="taskToAdd.reply_probability" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="1" max="100" />
+                            </div>
+                        </div>
+                        <div class="my-3">
+                            <label class="flex items-center gap-1">触发模式 <button @click="showHelp('trigger')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <select v-model="taskToAdd.trigger_mode" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
+                                <option value="new_floor">新楼层</option>
+                                <option value="keyword">关键词匹配</option>
+                            </select>
+                        </div>
+                        <div class="my-3" v-show="taskToAdd.trigger_mode === 'keyword'">
+                            <label class="flex items-center gap-1">匹配关键词 <button @click="showHelp('keywords')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <textarea v-model="taskToAdd.match_keywords" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="3" placeholder="每行一个关键词"></textarea>
+                        </div>
+                        <div class="my-3" v-show="taskToAdd.trigger_mode === 'keyword'">
+                            <label class="flex items-center gap-1">回复目标 <button @click="showHelp('reply_target')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <select v-model="taskToAdd.reply_target" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
+                                <option value="floor">回复楼层</option>
+                                <option value="subpost">楼中楼</option>
+                            </select>
+                        </div>
+                        <div class="my-3 flex items-center gap-2">
+                            <input type="checkbox" v-model="taskToAdd.allow_replied" id="allow-replied-add" class="form-checkbox" />
+                            <label for="allow-replied-add" class="flex items-center gap-1">允许重复回复已回复过的楼层 <button @click="showHelp('allow_replied')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                        </div>
+                        <div class="my-3 flex items-center gap-2">
+                            <input type="checkbox" v-model="taskToAdd.enabled" id="enabled-add" class="form-checkbox" />
+                            <label for="enabled-add">是否启用</label>
+                        </div>
+                    </div>
+
+                    <div class="flex gap-2">
+                        <button v-if="editMode" class="px-3 py-1 rounded-lg my-2 bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 text-gray-100 transition-colors" @click="saveEditTask">保存修改</button>
+                        <template v-else>
+                            <button class="px-3 py-1 rounded-lg my-2 bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 text-gray-100 transition-colors" @click="addTask()">保存并启用</button>
+                            <button class="px-3 py-1 rounded-lg my-2 bg-yellow-500 hover:bg-yellow-600 dark:hover:bg-yellow-400 text-gray-100 transition-colors" @click="addTask(0)">保存但暂停</button>
+                        </template>
+                        <button v-if="editMode" class="px-3 py-1 rounded-lg my-2 bg-gray-300 hover:bg-gray-400 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-900 dark:text-gray-100 transition-colors" @click="resetForm">取消编辑</button>
+                    </div>
                 </template>
             </Modal>
 
@@ -491,8 +628,7 @@ onMounted(() => {
                     <hr class="border-gray-400 dark:border-gray-600 my-3" />
                     <li>
                         <span class="font-bold">状态 : </span>
-                        <span v-if="task.enabled === 1" class="text-green-500">启用</span>
-                        <span v-else class="text-red-500">禁用</span>
+                        <span :class="taskStatusDisplay(task).class">{{ taskStatusDisplay(task).text }}</span>
                         <span class="ml-3 font-bold">重试次数 : </span><span class="font-mono">{{ task.retry_count }}</span>
                     </li>
                     <li>
@@ -512,6 +648,7 @@ onMounted(() => {
 
                 <hr class="border-gray-400 dark:border-gray-600 my-3" />
 
+                <button class="bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1" @click="editTask(task)">编辑</button>
                 <Modal class="mr-1 inline-block" :title="'确认删除任务 #' + task.id + ' ？'">
                     <template #default>
                         <button class="bg-pink-500 hover:bg-pink-600 dark:hover:bg-pink-400 rounded-lg px-3 py-1 text-gray-100 transition-colors">删除</button>
@@ -541,9 +678,9 @@ onMounted(() => {
         <div class="my-3 max-w-[48em]">
             <div class="my-3">
                 <label>百度账号</label>
-                <select v-model="testForm.pid" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
-                    <option value="0">请选择</option>
-                    <option v-for="(name, pid) in pidNameKV" :key="pid" :value="pid">{{ name }}</option>
+                <select v-model.number="testForm.pid" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
+                    <option :value="0">请选择</option>
+                    <option v-for="(name, pid) in pidNameKV" :key="pid" :value="Number(pid)">{{ name }}</option>
                 </select>
             </div>
             <div class="my-3">
@@ -586,6 +723,14 @@ onMounted(() => {
             </div>
         </div>
     </div>
+
+    <!-- 帮助弹窗 -->
+    <Modal title="帮助" v-show="true" :active="helpModalVisible" @active-callback="(v: boolean) => { if (!v) helpModalVisible = false }">
+        <template #default></template>
+        <template #container>
+            <div class="whitespace-pre-line text-sm">{{ helpTexts[helpModalKey] || '暂无帮助信息。' }}</div>
+        </template>
+    </Modal>
 
     <SyncModule :loading="loading" :callback="getTasksList" />
 </template>

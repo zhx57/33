@@ -144,24 +144,29 @@ export default defineNuxtRouteMiddleware(async (to, from) => {
                         )
                     }
                 }
-                if (!store.cache?.plugin_list) {
-                    const plugins = await Request(
-                        store.basePath + '/plugins',
-                        {
-                            headers: {
-                                Authorization: authorization
-                            }
-                        },
-                        to.name?.toString() || null
-                    )
-                    if (plugins.code === 200) {
-                        store.updateCache('plugin_list', plugins.data)
-                    }
-                }
             } catch (e) {
                 store.logout()
                 navigateTo('/signin')
                 throw e
+            }
+        }
+
+        if (!store.cache?.plugin_list) {
+            try {
+                const plugins = await Request(
+                    store.basePath + '/plugins',
+                    {
+                        headers: {
+                            Authorization: authorization
+                        }
+                    },
+                    to.name?.toString() || null
+                )
+                if (plugins.code === 200) {
+                    store.updateCache('plugin_list', plugins.data)
+                }
+            } catch (e) {
+                console.error(e)
             }
         }
 
