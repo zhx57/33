@@ -18,7 +18,7 @@ const tasksList = ref<
         uid: number
         pid: number
         fname: string
-        tid: number
+        tid: string
         last_floor: number
         last_replied_pid: number
         last_reply_time: number
@@ -407,7 +407,7 @@ onMounted(() => {
                     </div>
                     <div class="my-3">
                         <label>帖子ID</label>
-                        <input type="number" v-model="taskToAdd.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
+                        <input type="text" v-model="taskToAdd.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
                     </div>
                     <div class="my-3">
                         <label>回复内容</label>
@@ -552,7 +552,7 @@ onMounted(() => {
             </div>
             <div class="my-3">
                 <label>帖子ID</label>
-                <input type="number" v-model="testForm.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
+                <input type="text" v-model="testForm.tid" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" placeholder="帖子 tid" />
             </div>
             <div class="my-3">
                 <label>回复内容</label>
