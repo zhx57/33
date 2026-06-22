@@ -69,9 +69,8 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 		PluginNameFE:      "weltolk_autoreply",
 		Version:           "1.0",
 		Options: map[string]string{
-			"weltolk_autoreply_limit":        "5",
-			"weltolk_autoreply_id":           "0",
-			"weltolk_autoreply_action_limit": "50",
+			"weltolk_autoreply_limit": "5",
+			"weltolk_autoreply_id":    "0",
 		},
 		SettingOptions: map[string]PluginSettingOption{
 			"weltolk_autoreply_limit": {
@@ -79,13 +78,6 @@ var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 				OptionNameCN: "默认任务数量上限",
 				Validate: &_function.OptionRule{
 					Min: _function.VPtr(int64(1)),
-				},
-			},
-			"weltolk_autoreply_action_limit": {
-				OptionName:   "weltolk_autoreply_action_limit",
-				OptionNameCN: "每分钟最大执行数",
-				Validate: &_function.OptionRule{
-					Min: _function.VPtr(int64(0)),
 				},
 			},
 		},
@@ -954,14 +946,6 @@ func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[str
 	if err := dec.Decode(&result); err != nil {
 		return nil, err
 	}
-	// 检查贴吧 API 返回的业务错误码
-	if ec := weltolkToInt64(result["error_code"]); ec != 0 {
-		errMsg := weltolkToString(result["error_msg"])
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("error_code=%d", ec)
-		}
-		return result, fmt.Errorf("tieba api error: %s", errMsg)
-	}
 	return result, nil
 }
 
@@ -990,16 +974,13 @@ func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage 
 }
 
 // weltolkGetLastFloorContent 获取帖子的最新楼层内容。
-// totalPostCount 为帖子总数（由 weltolkGetReplyCount 返回的 totalPage），
-// 用于计算最后一页的页码，确保获取的是最新楼层而非第一页的旧楼层。
-func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPostCount int) []*weltolkFloor {
-	// 根据帖子总数和每页大小计算最后一页的页码
-	pn := 1
-	if totalPostCount > 0 && limit > 0 {
-		pn = (totalPostCount + limit - 1) / limit
-		if pn < 1 {
-			pn = 1
-		}
+// totalPage 为贴吧 API 返回的总页数，直接作为最后一页页码请求，
+// 确保获取的是最新楼层而非第一页的旧楼层。
+func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPage int) []*weltolkFloor {
+	// 直接使用总页数作为最后一页页码
+	pn := totalPage
+	if pn < 1 {
+		pn = 1
 	}
 	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, strconv.Itoa(pn), strconv.Itoa(limit), "0")
 	if err != nil || resp == nil {
