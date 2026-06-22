@@ -10,7 +10,7 @@ const tasksSwitch = ref<boolean>(false)
 const limit = ref<number>(0)
 const loadingList = ref<boolean>(false)
 
-const settings = ref<{ global_limit: string; personal_limit: string }>({ global_limit: '5', personal_limit: '' })
+const settings = ref<{ global_limit: string; personal_limit: string; global_cooldown: string }>({ global_limit: '5', personal_limit: '', global_cooldown: '0' })
 
 const tasksList = ref<
     {
@@ -27,7 +27,10 @@ const tasksList = ref<
         last_check_time: number
         log: string
         reply_content: string
+        reply_content_list: string
         reply_interval: number
+        reply_interval_min: number
+        reply_interval_max: number
         reply_probability: number
         enabled: number
         retry_count: number
@@ -35,6 +38,10 @@ const tasksList = ref<
         reply_target: string
         allow_replied: number
         match_keywords: string
+        max_count: number
+        active_time_start: string
+        active_time_end: string
+        success_count: number
     }[]
 >([])
 
@@ -45,26 +52,34 @@ const taskToAdd = ref<{
     pid: number
     fname: string
     tid: string
-    reply_content: string
-    reply_interval: number
+    reply_content_list: string
+    reply_interval_min: number
+    reply_interval_max: number
     reply_probability: number
     trigger_mode: string
     reply_target: string
     allow_replied: boolean
     match_keywords: string
     enabled: boolean
+    max_count: number
+    active_time_start: string
+    active_time_end: string
 }>({
     pid: 0,
     fname: '',
     tid: '',
-    reply_content: '',
-    reply_interval: 300,
+    reply_content_list: '',
+    reply_interval_min: 300,
+    reply_interval_max: 0,
     reply_probability: 100,
     trigger_mode: 'new_floor',
     reply_target: 'floor',
     allow_replied: false,
     match_keywords: '',
-    enabled: true
+    enabled: true,
+    max_count: 0,
+    active_time_start: '',
+    active_time_end: ''
 })
 
 const testForm = ref<{
@@ -102,7 +117,12 @@ const helpTexts: Record<string, string> = {
     content: '回复内容怎么写\n支持用花括号变量自动替换：\n{floor} — 当前回帖数\n{time} — 当前时间\n{date} — 当前日期\n{tid} — 帖子 ID\n{username} — 楼层用户名（只在关键词模式下有用）\n举例：第{floor}楼打卡！今天是{date}',
     fname: '贴吧名称\n就是目标贴吧的名字，不是网址。\n对的：天堂鸡汤\n错的：https://tieba.baidu.com/f?kw=天堂鸡汤\n打开贴吧页面，顶上看那个吧名就是。',
     tid: '帖子 ID\n帖子的纯数字编号，从浏览器地址栏就能看到。\n举例：链接是 https://tieba.baidu.com/p/12345678，那 ID 就是 12345678',
-    pid: '发帖账号\n选一个你绑定了的百度贴吧账号，机器就用这个号去回帖。\n如果这里没得选，说明你还没绑定账号，去账号管理绑定一下。'
+    pid: '发帖账号\n选一个你绑定了的百度贴吧账号，机器就用这个号去回帖。\n如果这里没得选，说明你还没绑定账号，去账号管理绑定一下。',
+    reply_content_list: '回复内容（随机发送）\n每行写一条回复内容，系统会随机选择一条发送。\n写多条可以避免每次回复都一样，更自然。\n举例：\n打卡打卡\n今天也来签到了\n继续坚持',
+    reply_interval_range: '回复间隔范围\n设置两次回复之间的等待时间范围。\n最小间隔和最大间隔可以不同，系统会在范围内随机取值。\n举例：最小60秒、最大300秒，意味着每次回复后等1-5分钟不等。\n如果最小和最大一样，就是固定间隔。',
+    max_count: '最大执行次数\n设置这个任务最多回复几次，0表示无限次。\n举例：填10，就是回复10次后自动停止。\n适合只想回复固定次数的场景。',
+    active_time: '活跃时间窗口\n设置每天允许自动回复的时间段。\n举例：08:00-22:00，就只在早8点到晚10点之间回复。\n留空表示全天24小时都可以回复。\n支持跨午夜，如 22:00-08:00。',
+    global_cooldown: '全局回复冷却时间（秒）\n设置任意两次回复之间的最小间隔，跨所有任务生效。\n举例：填300，就是任何任务回复后，所有任务至少等5分钟才能再回复。\n0表示不启用全局冷却，每个任务按自己的间隔独立运行。\n适合多任务场景，避免短时间内多个任务连续回复。'
 }
 
 const showHelp = (key: string) => {
@@ -159,14 +179,18 @@ const resetForm = () => {
         pid: 0,
         fname: '',
         tid: '',
-        reply_content: '',
-        reply_interval: 300,
+        reply_content_list: '',
+        reply_interval_min: 300,
+        reply_interval_max: 0,
         reply_probability: 100,
         trigger_mode: 'new_floor',
         reply_target: 'floor',
         allow_replied: false,
         match_keywords: '',
-        enabled: true
+        enabled: true,
+        max_count: 0,
+        active_time_start: '',
+        active_time_end: ''
     }
 }
 
@@ -186,14 +210,20 @@ const addTask = (enabledOverride?: number) => {
             pid: taskToAdd.value.pid.toString(),
             fname: taskToAdd.value.fname,
             tid: taskToAdd.value.tid,
-            reply_content: taskToAdd.value.reply_content,
-            reply_interval: taskToAdd.value.reply_interval.toString(),
+            reply_content: taskToAdd.value.reply_content_list.split('\n')[0] || '',
+            reply_content_list: taskToAdd.value.reply_content_list,
+            reply_interval: taskToAdd.value.reply_interval_min.toString(),
+            reply_interval_min: taskToAdd.value.reply_interval_min.toString(),
+            reply_interval_max: taskToAdd.value.reply_interval_max.toString(),
             reply_probability: taskToAdd.value.reply_probability.toString(),
             trigger_mode: taskToAdd.value.trigger_mode,
             reply_target: taskToAdd.value.reply_target,
             allow_replied: taskToAdd.value.allow_replied ? '1' : '0',
             match_keywords: taskToAdd.value.match_keywords,
-            enabled: enabled.toString()
+            enabled: enabled.toString(),
+            max_count: taskToAdd.value.max_count.toString(),
+            active_time_start: taskToAdd.value.active_time_start,
+            active_time_end: taskToAdd.value.active_time_end
         }).toString()
     }).then((res) => {
         if (res.code !== 200 && res.code !== 201 && res.code !== 204) {
@@ -213,14 +243,18 @@ const editTask = (task: (typeof tasksList.value)[0]) => {
         pid: task.pid,
         fname: task.fname,
         tid: task.tid.toString(),
-        reply_content: task.reply_content,
-        reply_interval: task.reply_interval,
+        reply_content_list: task.reply_content_list || task.reply_content || '',
+        reply_interval_min: task.reply_interval_min || task.reply_interval || 300,
+        reply_interval_max: task.reply_interval_max || 0,
         reply_probability: task.reply_probability,
         trigger_mode: task.trigger_mode || 'new_floor',
         reply_target: task.reply_target || 'floor',
         allow_replied: task.allow_replied === 1,
         match_keywords: task.match_keywords || '',
-        enabled: task.enabled === 1
+        enabled: task.enabled === 1,
+        max_count: task.max_count || 0,
+        active_time_start: task.active_time_start || '',
+        active_time_end: task.active_time_end || ''
     }
 }
 
@@ -239,14 +273,20 @@ const saveEditTask = () => {
             pid: taskToAdd.value.pid.toString(),
             fname: taskToAdd.value.fname,
             tid: taskToAdd.value.tid,
-            reply_content: taskToAdd.value.reply_content,
-            reply_interval: taskToAdd.value.reply_interval.toString(),
+            reply_content: taskToAdd.value.reply_content_list.split('\n')[0] || '',
+            reply_content_list: taskToAdd.value.reply_content_list,
+            reply_interval: taskToAdd.value.reply_interval_min.toString(),
+            reply_interval_min: taskToAdd.value.reply_interval_min.toString(),
+            reply_interval_max: taskToAdd.value.reply_interval_max.toString(),
             reply_probability: taskToAdd.value.reply_probability.toString(),
             trigger_mode: taskToAdd.value.trigger_mode,
             reply_target: taskToAdd.value.reply_target,
             allow_replied: taskToAdd.value.allow_replied ? '1' : '0',
             match_keywords: taskToAdd.value.match_keywords,
-            enabled: taskToAdd.value.enabled ? '1' : '0'
+            enabled: taskToAdd.value.enabled ? '1' : '0',
+            max_count: taskToAdd.value.max_count.toString(),
+            active_time_start: taskToAdd.value.active_time_start,
+            active_time_end: taskToAdd.value.active_time_end
         }).toString()
     }).then((res) => {
         if (res.code !== 200) {
@@ -275,6 +315,22 @@ const deleteTask = (id: number) => {
         }
         Notice('已删除任务: ' + id, 'success')
         tasksList.value = tasksList.value.filter((x) => x.id !== id)
+    })
+}
+
+const toggleTaskEnabled = (task: (typeof tasksList.value)[0]) => {
+    Request(store.basePath + '/plugins/weltolk_autoreply/list/' + task.id + '/toggle', {
+        headers: {
+            Authorization: store.authorization
+        },
+        method: 'POST'
+    }).then((res) => {
+        if (res.code !== 200) {
+            Notice(res.message, 'error')
+            return
+        }
+        task.enabled = task.enabled === 1 ? 0 : 1
+        Notice(task.enabled === 1 ? '已启用' : '已暂停', 'success')
     })
 }
 
@@ -344,6 +400,9 @@ const saveSettings = () => {
     if (settings.value.personal_limit !== '') {
         params.personal_limit = settings.value.personal_limit
     }
+    if (settings.value.global_cooldown !== '') {
+        params.global_cooldown = settings.value.global_cooldown
+    }
     Request(store.basePath + '/plugins/weltolk_autoreply/settings', {
         headers: {
             Authorization: store.authorization,
@@ -360,6 +419,7 @@ const saveSettings = () => {
         if (res.data) {
             settings.value.global_limit = res.data.global_limit || '5'
             settings.value.personal_limit = res.data.personal_limit || ''
+            settings.value.global_cooldown = res.data.global_cooldown || '0'
         }
     })
 }
@@ -487,6 +547,15 @@ onMounted(() => {
             </div>
         </div>
 
+        <div class="my-5">
+            <h4 class="my-2 text-xl">全局回复冷却 <button @click="showHelp('global_cooldown')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></h4>
+            <div class="max-w-[48em]">
+                <label>冷却时间（秒，0=不启用）</label>
+                <input type="number" v-model="settings.global_cooldown" class="bg-gray-100 dark:bg-gray-900 dark:text-gray-100 form-input w-full rounded-xl mt-1" min="0" placeholder="0" />
+                <p class="text-xs text-gray-500 mt-1">设置后，任意任务回复成功后，所有任务至少等待此时间才能再次回复。适合多任务场景，避免短时间连续回复。</p>
+            </div>
+        </div>
+
         <button class="bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 transition-colors rounded-lg px-3 py-1 text-gray-100" @click="saveSettings">保存设置</button>
     </div>
 
@@ -529,8 +598,8 @@ onMounted(() => {
                     <div class="border-b border-gray-400 dark:border-gray-600 pb-3 mb-3">
                         <h6 class="font-bold mb-2">3. 回复内容</h6>
                         <div class="my-3">
-                            <label class="flex items-center gap-1">回帖内容 <button @click="showHelp('content')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
-                            <textarea v-model="taskToAdd.reply_content" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="3" placeholder="支持变量：{floor} {time} {date} {tid} {username}"></textarea>
+                            <label class="flex items-center gap-1">回复内容（每行一条，随机发送） <button @click="showHelp('reply_content_list')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                            <textarea v-model="taskToAdd.reply_content_list" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-textarea" rows="4" placeholder="每行一条回复内容，系统会随机选择一条发送"></textarea>
                         </div>
                     </div>
 
@@ -539,12 +608,22 @@ onMounted(() => {
                         <h6 class="font-bold mb-2">4. 自动执行规则</h6>
                         <div class="my-3 flex gap-3">
                             <div class="grow">
-                                <label class="flex items-center gap-1">回复间隔（秒） <button @click="showHelp('interval')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
-                                <input type="number" v-model="taskToAdd.reply_interval" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" />
+                                <label class="flex items-center gap-1">最小间隔(秒) <button @click="showHelp('reply_interval_range')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                                <input type="number" v-model="taskToAdd.reply_interval_min" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" />
                             </div>
+                            <div class="grow">
+                                <label class="flex items-center gap-1">最大间隔(秒) <span class="text-xs text-gray-500">(0=与最小相同)</span></label>
+                                <input type="number" v-model="taskToAdd.reply_interval_max" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" />
+                            </div>
+                        </div>
+                        <div class="my-3 flex gap-3">
                             <div class="grow">
                                 <label class="flex items-center gap-1">回复概率（%） <button @click="showHelp('probability')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
                                 <input type="number" v-model="taskToAdd.reply_probability" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="1" max="100" />
+                            </div>
+                            <div class="grow">
+                                <label class="flex items-center gap-1">最大执行次数 <button @click="showHelp('max_count')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                                <input type="number" v-model="taskToAdd.max_count" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" min="0" placeholder="0=无限" />
                             </div>
                         </div>
                         <div class="my-3">
@@ -568,6 +647,16 @@ onMounted(() => {
                         <div class="my-3 flex items-center gap-2">
                             <input type="checkbox" v-model="taskToAdd.allow_replied" id="allow-replied-add" class="form-checkbox" />
                             <label for="allow-replied-add" class="flex items-center gap-1">允许重复回复已回复过的楼层 <button @click="showHelp('allow_replied')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                        </div>
+                        <div class="my-3 flex gap-3">
+                            <div class="grow">
+                                <label class="flex items-center gap-1">开始时间 <button @click="showHelp('active_time')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></label>
+                                <input type="time" v-model="taskToAdd.active_time_start" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" />
+                            </div>
+                            <div class="grow">
+                                <label class="flex items-center gap-1">结束时间</label>
+                                <input type="time" v-model="taskToAdd.active_time_end" class="bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1 form-input" />
+                            </div>
                         </div>
                         <div class="my-3 flex items-center gap-2">
                             <input type="checkbox" v-model="taskToAdd.enabled" id="enabled-add" class="form-checkbox" />
@@ -601,53 +690,30 @@ onMounted(() => {
             <div class="border-4 border-gray-400 dark:border-gray-700 rounded-xl p-5 my-3" v-for="task in tasksList" :key="task.id">
                 <ul class="marker:text-sky-500 list-disc list-inside">
                     <li>
-                        <span class="font-bold">贴吧 : </span><NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/f?ie=utf-8&kw=' + task.fname" target="blank">{{ task.fname }}</NuxtLink>
+                        <span class="font-bold">{{ task.fname }}吧 </span><NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/p/' + task.tid" target="blank">帖子{{ task.tid }}</NuxtLink>
                     </li>
                     <li>
-                        <span class="font-bold">帖子 : </span><NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/p/' + task.tid" target="blank">{{ task.tid }}</NuxtLink>
+                        <span class="font-bold">回复内容预览 : </span><span class="text-sm">{{ (task.reply_content_list || task.reply_content || '').split('\n')[0] }}{{ (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length > 1 ? '（随机' + (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length + '条）' : '' }}</span>
                     </li>
                     <li>
-                        <span class="font-bold">百度账号 : </span><span class="font-mono">{{ pidNameKV[task.pid] || task.pid }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">触发模式 : </span><span>{{ triggerModeText(task.trigger_mode) }}</span>
-                    </li>
-                    <li v-if="task.trigger_mode === 'keyword'">
-                        <span class="font-bold">关键词 : </span><span class="font-mono text-sm">{{ task.match_keywords || '（无）' }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">回复目标 : </span><span>{{ replyTargetText(task.reply_target) }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">回复内容 : </span><span class="text-sm">{{ task.reply_content }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">回复间隔 : </span><span class="font-mono">{{ task.reply_interval }} 秒</span>
+                        <span class="font-bold">间隔范围 : </span><span class="font-mono">{{ task.reply_interval_min === task.reply_interval_max || !task.reply_interval_max ? task.reply_interval_min + '秒' : task.reply_interval_min + '-' + task.reply_interval_max + '秒' }}</span>
                         <span class="ml-3 font-bold">概率 : </span><span class="font-mono">{{ task.reply_probability }}%</span>
                     </li>
-                    <hr class="border-gray-400 dark:border-gray-600 my-3" />
+                    <li>
+                        <span class="font-bold">执行次数 : </span><span class="font-mono">{{ task.success_count || 0 }}/{{ task.max_count > 0 ? task.max_count : '无限' }}</span>
+                    </li>
+                    <li>
+                        <span class="font-bold">活跃时间 : </span><span class="font-mono">{{ task.active_time_start && task.active_time_end ? task.active_time_start + '-' + task.active_time_end : '全天' }}</span>
+                    </li>
                     <li>
                         <span class="font-bold">状态 : </span>
                         <span :class="taskStatusDisplay(task).class">{{ taskStatusDisplay(task).text }}</span>
-                        <span class="ml-3 font-bold">重试次数 : </span><span class="font-mono">{{ task.retry_count }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">最后回复楼层 : </span><span class="font-mono">{{ task.last_floor }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">最后执行 : </span><span class="font-mono">{{ task.last_check_time > 0 ? getPubDate(new Date(task.last_check_time * 1000)) : '从未执行' }}</span>
-                    </li>
-                    <li>
-                        <span class="font-bold">执行结果 : </span>
-                        <SvgCheck v-if="task.last_status === 'ok'" height="1em" width="1em" class="inline-block -mt-0.5" />
-                        <SvgCross v-else height="1em" width="1em" class="inline-block -mt-0.5" />
-                        <span class="ml-1">{{ statusText(task.last_status) }}</span>
-                        <span v-if="task.last_error" class="text-sm text-red-500 ml-2">{{ task.last_error }}</span>
                     </li>
                 </ul>
 
                 <hr class="border-gray-400 dark:border-gray-600 my-3" />
 
+                <button :class="task.enabled === 1 ? 'bg-green-500 hover:bg-green-600 dark:hover:bg-green-400' : 'bg-gray-400 hover:bg-gray-500 dark:bg-gray-600 dark:hover:bg-gray-500'" class="rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1" @click="toggleTaskEnabled(task)">{{ task.enabled === 1 ? '已启用' : '已暂停' }}</button>
                 <button class="bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1" @click="editTask(task)">编辑</button>
                 <Modal class="mr-1 inline-block" :title="'确认删除任务 #' + task.id + ' ？'">
                     <template #default>
