@@ -2,39 +2,66 @@ package _plugin
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
+	"math/big"
+	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
 
 	_function "github.com/BANKA2017/tbsign_go/functions"
 	"github.com/BANKA2017/tbsign_go/model"
-	"github.com/labstack/echo/v4"
-	"gorm.io/gorm"
 )
 
 func init() {
-	PluginList.Register(WeltolkAutoreplyPlugin)
+	PluginList.Register(WeltolkAutoReplyPlugin)
 }
 
-// ============================================================
-// Plugin struct
-// ============================================================
-
-type WeltolkAutoreplyPluginType struct {
+type WeltolkAutoReplyPluginType struct {
 	PluginInfo
 }
 
-var WeltolkAutoreplyPlugin = _function.VPtr(WeltolkAutoreplyPluginType{
+// autoreplyRand 是插件独立的随机数生成器，避免并发使用全局 math/rand
+var autoreplyRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
+var autoreplyRandMu sync.Mutex
+
+// autoreplyRandIntn 返回 [0, n) 的非负伪随机数，线程安全
+func autoreplyRandIntn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	autoreplyRandMu.Lock()
+	defer autoreplyRandMu.Unlock()
+	return autoreplyRand.Intn(n)
+}
+
+// autoreplyRandInt63 返回 [0, 1<<63) 的非负伪随机数，线程安全
+func autoreplyRandInt63() int64 {
+	autoreplyRandMu.Lock()
+	defer autoreplyRandMu.Unlock()
+	return autoreplyRand.Int63()
+}
+
+var WeltolkAutoReplyPlugin = _function.VPtr(WeltolkAutoReplyPluginType{
 	PluginInfo{
 		Name:              "weltolk_autoreply",
 		PluginNameCN:      "自动回帖",
@@ -49,9 +76,9 @@ var WeltolkAutoreplyPlugin = _function.VPtr(WeltolkAutoreplyPluginType{
 		SettingOptions: map[string]PluginSettingOption{
 			"weltolk_autoreply_limit": {
 				OptionName:   "weltolk_autoreply_limit",
-				OptionNameCN: "可添加自动回帖任务上限",
+				OptionNameCN: "默认任务数量上限",
 				Validate: &_function.OptionRule{
-					Min: _function.VPtr(int64(0)),
+					Min: _function.VPtr(int64(1)),
 				},
 			},
 			"weltolk_autoreply_action_limit": {
@@ -63,272 +90,163 @@ var WeltolkAutoreplyPlugin = _function.VPtr(WeltolkAutoreplyPluginType{
 			},
 		},
 		Endpoints: []PluginEndpointStruct{
-			{Method: http.MethodGet, Path: "switch", Function: PluginWeltolkAutoreplyGetSwitch},
-			{Method: http.MethodPost, Path: "switch", Function: PluginWeltolkAutoreplySwitch},
-			{Method: http.MethodGet, Path: "list", Function: PluginWeltolkAutoreplyGetList},
-			{Method: http.MethodPatch, Path: "list", Function: PluginWeltolkAutoreplyAddTask},
-			{Method: http.MethodPut, Path: "list/:id", Function: PluginWeltolkAutoreplyEditTask},
-			{Method: http.MethodDelete, Path: "list/:id", Function: PluginWeltolkAutoreplyDelTask},
-			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoreplyDelAllTasks},
-			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoreplyTest},
-			{Method: http.MethodGet, Path: "settings", Function: PluginWeltolkAutoreplyGetSettings},
-			{Method: http.MethodPut, Path: "settings", Function: PluginWeltolkAutoreplySetSettings},
+			{Method: http.MethodGet, Path: "switch", Function: PluginWeltolkAutoReplyGetSwitch},
+			{Method: http.MethodPost, Path: "switch", Function: PluginWeltolkAutoReplySwitch},
+			{Method: http.MethodGet, Path: "list", Function: PluginWeltolkAutoReplyList},
+			{Method: http.MethodPatch, Path: "list", Function: PluginWeltolkAutoReplyListAdd},
+			{Method: http.MethodPut, Path: "list/:id", Function: PluginWeltolkAutoReplyListEdit},
+			{Method: http.MethodDelete, Path: "list/:id", Function: PluginWeltolkAutoReplyListDelete},
+			{Method: http.MethodPost, Path: "list/:id/toggle", Function: PluginWeltolkAutoReplyListToggle},
+			{Method: http.MethodPost, Path: "list/empty", Function: PluginWeltolkAutoReplyListEmpty},
+			{Method: http.MethodPost, Path: "test", Function: PluginWeltolkAutoReplyTest},
+			{Method: http.MethodGet, Path: "settings", Function: PluginWeltolkAutoReplySettings},
+			{Method: http.MethodPut, Path: "settings", Function: PluginWeltolkAutoReplySettingsUpdate},
 		},
 	},
 })
 
-// ============================================================
-// Protobuf encoding helpers
-// ============================================================
+const weltolkAutoreplyOpenKey = "weltolk_autoreply_open"
+const weltolkAutoreplyLimitKey = "weltolk_autoreply_limit"
+const weltolkAutoreplyHighWaterKey = "weltolk_autoreply_high_water"
 
-func pbEncodeVarint(value uint64) []byte {
-	var buf []byte
-	for value >= 0x80 {
-		buf = append(buf, byte((value&0x7F)|0x80))
-		value >>= 7
+// helpers
+
+func weltolkAutoreplyGetUserLimit(uid string) int {
+	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
+	if p, err := strconv.Atoi(personal); err == nil && p > 0 {
+		return p
 	}
-	buf = append(buf, byte(value&0x7F))
-	return buf
+	global := _function.GetOption(weltolkAutoreplyLimitKey)
+	if g, err := strconv.Atoi(global); err == nil && g > 0 {
+		return g
+	}
+	return 5
 }
 
-func pbEncodeTag(fieldNumber int, wireType byte) []byte {
-	return pbEncodeVarint(uint64(fieldNumber<<3) | uint64(wireType))
+// calcEffectiveInterval 计算实际回复间隔
+// 使用 seed 确保同一任务在同一 LastReplyTime 下计算出的间隔稳定，
+// 避免每次 cron tick 都重新随机导致间隔不断变化、任务可能永远无法执行。
+// 规则：min>0 && max>=min -> [min, max]
+//      min>0 && max<min  -> min（按min固定）
+//      min<=0 && max>0   -> [60, max]，避免0导致疯狂回复
+//      min<=0 && max<=0  -> 使用旧的 reply_interval 字段，若仍<=0则默认60
+func calcEffectiveInterval(replyIntervalMin, replyIntervalMax, replyInterval int32, seed int64) int32 {
+	minVal := replyIntervalMin
+	maxVal := replyIntervalMax
+
+	if minVal > 0 && maxVal >= minVal {
+		if maxVal == minVal {
+			return minVal
+		}
+		span := int64(maxVal - minVal + 1)
+		offset := seed % span
+		if offset < 0 {
+			offset = -offset
+		}
+		return minVal + int32(offset)
+	}
+	if minVal > 0 {
+		return minVal
+	}
+	if maxVal > 0 {
+		// 只设置了最大值，给一个合理下限避免过频
+		lower := int32(60)
+		if maxVal < lower {
+			lower = maxVal
+		}
+		if maxVal == lower {
+			return lower
+		}
+		span := int64(maxVal - lower + 1)
+		offset := seed % span
+		if offset < 0 {
+			offset = -offset
+		}
+		return lower + int32(offset)
+	}
+	if replyInterval > 0 {
+		return replyInterval
+	}
+	return 60
 }
 
-func pbEncodeString(fieldNumber int, value string) []byte {
-	tag := pbEncodeTag(fieldNumber, 2)
-	v := []byte(value)
-	lenBytes := pbEncodeVarint(uint64(len(v)))
-	return append(append(tag, lenBytes...), v...)
+func weltolkAutoreplyAppendLog(taskID int32, entry string) {
+	var task model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Select("log").Take(&task).Error; err != nil {
+		return
+	}
+	task.Log += entry
+	// 限制日志最大长度，保留最新的部分
+	const maxLogLen = 50000
+	if len(task.Log) > maxLogLen {
+		task.Log = task.Log[len(task.Log)-maxLogLen:]
+	}
+	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("log", task.Log)
 }
 
-func pbEncodeInt32(fieldNumber int, value int) []byte {
-	tag := pbEncodeTag(fieldNumber, 0)
-	return append(tag, pbEncodeVarint(uint64(value))...)
+func weltolkAutoreplyNowString(now int64) string {
+	return time.Unix(now, 0).Format("2006-01-02 15:04:05")
 }
 
-func pbEncodeInt64(fieldNumber int, value int64) []byte {
-	tag := pbEncodeTag(fieldNumber, 0)
-	return append(tag, pbEncodeVarint(uint64(value))...)
+func weltolkAutoreplySkipTask(taskID int32, pid int32, now int64, logTime, highWaterKey, status, lastError, logMsg string) {
+	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+		"pid":             pid,
+		"last_status":     status,
+		"last_error":      lastError,
+		"last_check_time": now,
+	})
+	weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] %s<br>", logTime, logMsg))
+	_function.SetOption(highWaterKey, int(taskID)+1)
 }
 
-func pbEncodeDouble(fieldNumber int, value float64) []byte {
-	tag := pbEncodeTag(fieldNumber, 1)
+// protobuf helpers
+
+func autoreplyEncodeVarint(v uint64) []byte {
+	var buf [10]byte
+	var n int
+	for v >= 0x80 {
+		buf[n] = byte(v&0x7F | 0x80)
+		n++
+		v >>= 7
+	}
+	buf[n] = byte(v)
+	n++
+	return buf[:n]
+}
+
+func autoreplyEncodeTag(fieldNumber, wireType int) []byte {
+	return autoreplyEncodeVarint(uint64(fieldNumber<<3) | uint64(wireType))
+}
+
+func autoreplyEncodeString(fieldNumber int, s string) []byte {
+	b := []byte(s)
+	return bytes.Join([][]byte{
+		autoreplyEncodeTag(fieldNumber, 2),
+		autoreplyEncodeVarint(uint64(len(b))),
+		b,
+	}, nil)
+}
+
+func autoreplyEncodeInt32(fieldNumber int, v int32) []byte {
+	return append(autoreplyEncodeTag(fieldNumber, 0), autoreplyEncodeVarint(uint64(v))...)
+}
+
+func autoreplyEncodeInt64(fieldNumber int, v int64) []byte {
+	return append(autoreplyEncodeTag(fieldNumber, 0), autoreplyEncodeVarint(uint64(v))...)
+}
+
+func autoreplyEncodeDouble(fieldNumber int, v float64) []byte {
 	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, math.Float64bits(value))
-	return append(tag, buf...)
+	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
+	return append(autoreplyEncodeTag(fieldNumber, 1), buf...)
 }
 
-func pbEncodeMessage(fieldNumber int, data []byte) []byte {
-	tag := pbEncodeTag(fieldNumber, 2)
-	lenBytes := pbEncodeVarint(uint64(len(data)))
-	return append(append(tag, lenBytes...), data...)
-}
-
-// ============================================================
-// Device ID generation
-// ============================================================
-
-type autoreplyDeviceIDs struct {
-	CUID         string
-	CUIDGalaxy2  string
-	C3Aid        string
-	AndroidID    string
-	SampleID     string
-	ZID          string
-}
-
-func autoreplyGenerateDeviceIDs() autoreplyDeviceIDs {
-	// android_id: 16 hex chars
-	androidIDBytes := make([]byte, 8)
-	_, _ = rand.Read(androidIDBytes)
-	androidID := hex.EncodeToString(androidIDBytes)
-
-	// UUID v4
-	uuidBytes := make([]byte, 16)
-	_, _ = rand.Read(uuidBytes)
-	uuidBytes[6] = (uuidBytes[6] & 0x0f) | 0x40 // version 4
-	uuidBytes[8] = (uuidBytes[8] & 0x3f) | 0x80 // variant 10
-	uuid := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		binary.BigEndian.Uint32(uuidBytes[0:4]),
-		binary.BigEndian.Uint16(uuidBytes[4:6]),
-		binary.BigEndian.Uint16(uuidBytes[6:8]),
-		binary.BigEndian.Uint16(uuidBytes[8:10]),
-		uuidBytes[10:16],
-	)
-
-	cuid := "baidutiebaapp" + uuid
-
-	// cuid_galaxy2: 32 uppercase hex + "|" + 9 uppercase alphanumeric
-	galaxyHex := make([]byte, 16)
-	_, _ = rand.Read(galaxyHex)
-	galaxyB64 := make([]byte, 8)
-	_, _ = rand.Read(galaxyB64)
-	galaxyB64Str := strings.ToUpper(base64URLStrip(string(galaxyB64)))
-	if len(galaxyB64Str) > 9 {
-		galaxyB64Str = galaxyB64Str[:9]
-	}
-	cuidGalaxy2 := strings.ToUpper(hex.EncodeToString(galaxyHex)) + "|" + galaxyB64Str
-
-	// c3_aid: "A00-" + 32 uppercase hex + "-" + 8 uppercase alphanumeric
-	aidHex := make([]byte, 16)
-	_, _ = rand.Read(aidHex)
-	aidB64 := make([]byte, 8)
-	_, _ = rand.Read(aidB64)
-	aidB64Str := strings.ToUpper(base64URLStrip(string(aidB64)))
-	if len(aidB64Str) > 8 {
-		aidB64Str = aidB64Str[:8]
-	}
-	c3Aid := "A00-" + strings.ToUpper(hex.EncodeToString(aidHex)) + "-" + aidB64Str
-
-	// sample_id: 16 uppercase alphanumeric
-	sampleB64 := make([]byte, 12)
-	_, _ = rand.Read(sampleB64)
-	sampleID := strings.ToUpper(base64URLStrip(string(sampleB64)))
-	if len(sampleID) > 16 {
-		sampleID = sampleID[:16]
-	}
-
-	return autoreplyDeviceIDs{
-		CUID:        cuid,
-		CUIDGalaxy2: cuidGalaxy2,
-		C3Aid:       c3Aid,
-		AndroidID:   androidID,
-		SampleID:    sampleID,
-		ZID:         "",
-	}
-}
-
-func base64URLStrip(s string) string {
-	s = strings.ReplaceAll(s, "+", "")
-	s = strings.ReplaceAll(s, "/", "")
-	s = strings.ReplaceAll(s, "=", "")
-	return s
-}
-
-// ============================================================
-// Build AddPostReqIdl protobuf binary
-// ============================================================
-
-func autoreplyBuildPostProto(bduss, stoken, tbs, fname string, fid int64, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) []byte {
-	dev := autoreplyGenerateDeviceIDs()
-	timestamp := time.Now().UnixMilli()
-	now := time.Now()
-	eventDay := fmt.Sprintf("%d%d%d", now.Year(), int(now.Month()), now.Day())
-	installTime := timestamp - 86400*30*1000
-
-	// common
-	var common []byte
-	common = append(common, pbEncodeInt32(1, 2)...)
-	common = append(common, pbEncodeString(2, "12.35.1.0")...)
-	common = append(common, pbEncodeString(3, dev.CUID)...)
-	common = append(common, pbEncodeString(5, "000000000000000")...)
-	common = append(common, pbEncodeString(6, "1020031h")...)
-	common = append(common, pbEncodeString(7, dev.CUIDGalaxy2)...)
-	common = append(common, pbEncodeInt64(8, timestamp)...)
-	common = append(common, pbEncodeString(9, "SM-G988N")...)
-	common = append(common, pbEncodeString(10, bduss)...)
-	common = append(common, pbEncodeString(11, tbs)...)
-	common = append(common, pbEncodeInt32(12, 1)...)
-	common = append(common, pbEncodeString(24, "1.0.3")...)
-	common = append(common, pbEncodeString(25, "9")...)
-	common = append(common, pbEncodeString(26, "samsung")...)
-	common = append(common, pbEncodeString(28, "3.0.0")...)
-	common = append(common, pbEncodeString(29, "")...)
-	common = append(common, pbEncodeString(30, stoken)...)
-	common = append(common, pbEncodeString(31, dev.ZID)...)
-	common = append(common, pbEncodeString(32, dev.CUIDGalaxy2)...)
-	common = append(common, pbEncodeString(33, "")...)
-	common = append(common, pbEncodeString(34, "")...)
-	common = append(common, pbEncodeString(35, dev.C3Aid)...)
-	common = append(common, pbEncodeString(36, dev.SampleID)...)
-	common = append(common, pbEncodeInt32(37, 720)...)
-	common = append(common, pbEncodeInt32(38, 1280)...)
-	common = append(common, pbEncodeDouble(39, 1.5)...)
-	common = append(common, pbEncodeInt32(40, 0)...)
-	common = append(common, pbEncodeInt32(41, 0)...)
-	common = append(common, pbEncodeString(42, "2.34.0")...)
-	common = append(common, pbEncodeString(43, "3340042")...)
-	common = append(common, pbEncodeString(44, "1038000")...)
-	common = append(common, pbEncodeInt64(49, installTime)...)
-	common = append(common, pbEncodeInt64(50, installTime)...)
-	common = append(common, pbEncodeInt64(51, installTime)...)
-	common = append(common, pbEncodeString(53, eventDay)...)
-	common = append(common, pbEncodeString(54, dev.AndroidID)...)
-	common = append(common, pbEncodeInt32(55, 1)...)
-	common = append(common, pbEncodeString(56, "")...)
-	common = append(common, pbEncodeInt32(57, 1)...)
-	common = append(common, pbEncodeString(60, "0")...)
-	common = append(common, pbEncodeString(61, "")...)
-	common = append(common, pbEncodeString(62, "tieba/12.35.1.0")...)
-	common = append(common, pbEncodeInt32(63, 1)...)
-	common = append(common, pbEncodeString(70, "0.4")...)
-
-	// data
-	var data []byte
-	data = append(data, pbEncodeMessage(1, common)...)
-	data = append(data, pbEncodeString(6, "1")...)         // anonymous
-	data = append(data, pbEncodeString(7, "0")...)         // can_no_forum
-	data = append(data, pbEncodeString(8, "0")...)         // is_feedback
-	data = append(data, pbEncodeString(9, "0")...)         // takephoto_num
-	data = append(data, pbEncodeString(10, "0")...)        // entrance_type
-	data = append(data, pbEncodeString(16, "12")...)       // vcode_tag
-	data = append(data, pbEncodeString(18, "1")...)        // new_vcode
-	data = append(data, pbEncodeString(19, content)...)    // content
-	data = append(data, pbEncodeString(26, strconv.FormatInt(fid, 10))...) // fid
-	if quoteID == "" {
-		data = append(data, pbEncodeString(28, "")...) // v_fid
-		data = append(data, pbEncodeString(29, "")...) // v_fname
-	}
-	data = append(data, pbEncodeString(30, fname)...)  // kw
-	data = append(data, pbEncodeString(31, "0")...)    // is_barrage
-	if quoteID == "" {
-		data = append(data, pbEncodeString(32, "0")...) // barrage_time
-	}
-	data = append(data, pbEncodeString(45, strconv.FormatInt(tid, 10))...) // tid
-	if quoteID != "" {
-		data = append(data, pbEncodeString(46, quoteID)...)   // quote_id
-	}
-	data = append(data, pbEncodeString(47, "0")...)        // is_twzhibo_thread
-	data = append(data, pbEncodeString(48, floorNum)...)   // floor_num
-	if quoteID != "" {
-		data = append(data, pbEncodeString(49, quoteID)...)   // repostid
-	}
-	if subPostID != "" {
-		data = append(data, pbEncodeString(50, subPostID)...) // sub_post_id
-	}
-	data = append(data, pbEncodeString(51, "0")...) // is_ad
-	data = append(data, pbEncodeString(52, "0")...) // is_addition
-	data = append(data, pbEncodeString(53, "0")...) // is_giftpost
-	// field 55 post_from
-	if quoteID == "" && subPostID == "" {
-		data = append(data, pbEncodeString(55, "13")...) // 主题回复
-	} else if subPostID == "" {
-		data = append(data, pbEncodeString(55, "0")...) // 楼层回复
-	}
-	// sub_post_id 非空时不编码 field 55
-	data = append(data, pbEncodeString(58, showName)...) // name_show
-	data = append(data, pbEncodeString(60, "0")...)      // is_pictxt
-	if quoteID != "" && replyUID != "" {
-		data = append(data, pbEncodeString(20, replyUID)...) // reply_uid
-	}
-	data = append(data, pbEncodeInt32(64, 0)...) // show_custom_figure
-	data = append(data, pbEncodeInt32(67, 0)...) // is_show_bless
-
-	// req
-	req := pbEncodeMessage(1, data)
-	return req
-}
-
-// ============================================================
-// Protobuf response parser
-// ============================================================
-
-type autoreplyParseResult struct {
-	ErrorNo    int
-	ErrorMsg   string
-	NeedVcode  bool
-	RawDebug   string
+func autoreplyEncodeMessage(fieldNumber int, data []byte) []byte {
+	return bytes.Join([][]byte{
+		autoreplyEncodeTag(fieldNumber, 2),
+		autoreplyEncodeVarint(uint64(len(data))),
+		data,
+	}, nil)
 }
 
 func autoreplyReadVarint(data []byte, pos int) (uint64, int, bool) {
@@ -338,37 +256,164 @@ func autoreplyReadVarint(data []byte, pos int) (uint64, int, bool) {
 		b := data[pos]
 		pos++
 		value |= uint64(b&0x7F) << shift
-		if (b & 0x80) == 0 {
+		if b&0x80 == 0 {
 			return value, pos, true
 		}
 		shift += 7
+		if shift > 63 {
+			return 0, pos, false
+		}
 	}
 	return 0, pos, false
 }
 
-func autoreplySkipField(data []byte, pos int, wireType byte) (int, bool) {
-	switch wireType {
-	case 0:
-		_, newPos, ok := autoreplyReadVarint(data, pos)
-		return newPos, ok
-	case 1:
-		return pos + 8, true
-	case 2:
-		length, newPos, ok := autoreplyReadVarint(data, pos)
-		if !ok {
-			return pos, false
-		}
-		return newPos + int(length), true
-	case 5:
-		return pos + 4, true
-	default:
-		return pos, false
+func autoreplyRandomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func autoreplyRandomAlphanumeric(n int, upper bool) string {
+	const chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+	out := chars
+	if upper {
+		out = strings.ToUpper(chars)
+	}
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(out))))
+		sb.WriteByte(out[idx.Int64()])
+	}
+	return sb.String()
+}
+
+func autoreplyGenerateDeviceIDs() map[string]string {
+	androidID := autoreplyRandomHex(8)
+	u := uuid.New().String()
+	cuid := "baidutiebaapp" + u
+	cuidGalaxy2 := strings.ToUpper(autoreplyRandomHex(16)) + "|" + autoreplyRandomAlphanumeric(9, true)
+	c3Aid := "A00-" + strings.ToUpper(autoreplyRandomHex(16)) + "-" + autoreplyRandomAlphanumeric(8, true)
+	sampleID := autoreplyRandomAlphanumeric(16, true)
+	return map[string]string{
+		"cuid":         cuid,
+		"cuid_galaxy2": cuidGalaxy2,
+		"c3_aid":       c3Aid,
+		"android_id":   androidID,
+		"z_id":         "",
+		"sample_id":    sampleID,
 	}
 }
 
+func autoreplyBuildPostProto(bduss, stoken, tbs, fname string, fid, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) []byte {
+	now := time.Now()
+	timestamp := now.UnixMilli()
+	eventDay := fmt.Sprintf("%d%d%d", now.Year(), int(now.Month()), now.Day())
+	installTime := timestamp - 86400*30
+
+	dev := autoreplyGenerateDeviceIDs()
+
+	common := bytes.NewBuffer(nil)
+	common.Write(autoreplyEncodeInt32(1, 2))
+	common.Write(autoreplyEncodeString(2, "12.35.1.0"))
+	common.Write(autoreplyEncodeString(3, dev["cuid"]))
+	common.Write(autoreplyEncodeString(5, "000000000000000"))
+	common.Write(autoreplyEncodeString(6, "1020031h"))
+	common.Write(autoreplyEncodeString(7, dev["cuid_galaxy2"]))
+	common.Write(autoreplyEncodeInt64(8, timestamp))
+	common.Write(autoreplyEncodeString(9, "SM-G988N"))
+	common.Write(autoreplyEncodeString(10, bduss))
+	common.Write(autoreplyEncodeString(11, tbs))
+	common.Write(autoreplyEncodeInt32(12, 1))
+	common.Write(autoreplyEncodeString(24, "1.0.3"))
+	common.Write(autoreplyEncodeString(25, "9"))
+	common.Write(autoreplyEncodeString(26, "samsung"))
+	common.Write(autoreplyEncodeString(28, "3.0.0"))
+	common.Write(autoreplyEncodeString(29, ""))
+	common.Write(autoreplyEncodeString(30, stoken))
+	common.Write(autoreplyEncodeString(31, dev["z_id"]))
+	common.Write(autoreplyEncodeString(32, dev["cuid_galaxy2"]))
+	common.Write(autoreplyEncodeString(33, ""))
+	common.Write(autoreplyEncodeString(34, ""))
+	common.Write(autoreplyEncodeString(35, dev["c3_aid"]))
+	common.Write(autoreplyEncodeString(36, dev["sample_id"]))
+	common.Write(autoreplyEncodeInt32(37, 720))
+	common.Write(autoreplyEncodeInt32(38, 1280))
+	common.Write(autoreplyEncodeDouble(39, 1.5))
+	common.Write(autoreplyEncodeInt32(40, 0))
+	common.Write(autoreplyEncodeInt32(41, 0))
+	common.Write(autoreplyEncodeString(42, "2.34.0"))
+	common.Write(autoreplyEncodeString(43, "3340042"))
+	common.Write(autoreplyEncodeString(44, "1038000"))
+	common.Write(autoreplyEncodeInt64(49, installTime))
+	common.Write(autoreplyEncodeInt64(50, installTime))
+	common.Write(autoreplyEncodeInt64(51, installTime))
+	common.Write(autoreplyEncodeString(53, eventDay))
+	common.Write(autoreplyEncodeString(54, dev["android_id"]))
+	common.Write(autoreplyEncodeInt32(55, 1))
+	common.Write(autoreplyEncodeString(56, ""))
+	common.Write(autoreplyEncodeInt32(57, 1))
+	common.Write(autoreplyEncodeString(60, "0"))
+	common.Write(autoreplyEncodeString(61, ""))
+	common.Write(autoreplyEncodeString(62, "tieba/12.35.1.0"))
+	common.Write(autoreplyEncodeInt32(63, 1))
+	common.Write(autoreplyEncodeString(70, "0.4"))
+
+	data := bytes.NewBuffer(nil)
+	data.Write(autoreplyEncodeMessage(1, common.Bytes()))
+	data.Write(autoreplyEncodeString(6, "1"))
+	data.Write(autoreplyEncodeString(7, "0"))
+	data.Write(autoreplyEncodeString(8, "0"))
+	data.Write(autoreplyEncodeString(9, "0"))
+	data.Write(autoreplyEncodeString(10, "0"))
+	data.Write(autoreplyEncodeString(16, "12"))
+	data.Write(autoreplyEncodeString(18, "1"))
+	data.Write(autoreplyEncodeString(19, content))
+	data.Write(autoreplyEncodeString(26, strconv.FormatInt(fid, 10)))
+	if quoteID == "" {
+		data.Write(autoreplyEncodeString(28, ""))
+		data.Write(autoreplyEncodeString(29, ""))
+	}
+	data.Write(autoreplyEncodeString(30, fname))
+	data.Write(autoreplyEncodeString(31, "0"))
+	if quoteID == "" {
+		data.Write(autoreplyEncodeString(32, "0"))
+	}
+	data.Write(autoreplyEncodeString(45, strconv.FormatInt(tid, 10)))
+	if quoteID != "" {
+		data.Write(autoreplyEncodeString(46, quoteID))
+	}
+	data.Write(autoreplyEncodeString(47, "0"))
+	data.Write(autoreplyEncodeString(48, floorNum))
+	if quoteID != "" {
+		data.Write(autoreplyEncodeString(49, quoteID))
+	}
+	if subPostID != "" {
+		data.Write(autoreplyEncodeString(50, subPostID))
+	}
+	data.Write(autoreplyEncodeString(51, "0"))
+	data.Write(autoreplyEncodeString(52, "0"))
+	data.Write(autoreplyEncodeString(53, "0"))
+	if subPostID == "" {
+		if quoteID == "" {
+			data.Write(autoreplyEncodeString(55, "13"))
+		} else {
+			data.Write(autoreplyEncodeString(55, "0"))
+		}
+	}
+	data.Write(autoreplyEncodeString(58, showName))
+	data.Write(autoreplyEncodeString(60, "0"))
+	if quoteID != "" && replyUID != "" {
+		data.Write(autoreplyEncodeString(20, replyUID))
+	}
+	data.Write(autoreplyEncodeInt32(64, 0))
+	data.Write(autoreplyEncodeInt32(67, 0))
+
+	return autoreplyEncodeMessage(1, data.Bytes())
+}
+
 func autoreplyParseError(data []byte) (int, string) {
-	errorNo := 0
-	errMsg := ""
+	var errorno int
+	var errmsg string
 	pos := 0
 	for pos < len(data) {
 		tag, newPos, ok := autoreplyReadVarint(data, pos)
@@ -377,34 +422,35 @@ func autoreplyParseError(data []byte) (int, string) {
 		}
 		pos = newPos
 		fieldNumber := int(tag >> 3)
-		wireType := byte(tag & 0x07)
-
+		wireType := int(tag & 0x07)
 		if wireType == 0 && fieldNumber == 1 {
-			val, newPos2, ok := autoreplyReadVarint(data, pos)
+			v, np, ok := autoreplyReadVarint(data, pos)
 			if !ok {
 				break
 			}
-			errorNo = int(val)
-			pos = newPos2
+			errorno = int(v)
+			pos = np
 		} else if wireType == 2 && fieldNumber == 2 {
-			length, newPos2, ok := autoreplyReadVarint(data, pos)
+			length, np, ok := autoreplyReadVarint(data, pos)
 			if !ok {
 				break
 			}
-			pos = newPos2
-			if pos+int(length) <= len(data) {
-				errMsg = string(data[pos : pos+int(length)])
+			pos = np
+			end := pos + int(length)
+			if end > len(data) {
+				break
 			}
-			pos += int(length)
+			errmsg = string(data[pos:end])
+			pos = end
 		} else {
-			newPos, ok := autoreplySkipField(data, pos, wireType)
-			if !ok {
+			np := autoreplySkipField(data, pos, wireType)
+			if np < 0 {
 				break
 			}
-			pos = newPos
+			pos = np
 		}
 	}
-	return errorNo, errMsg
+	return errorno, errmsg
 }
 
 func autoreplyParseNeedVcode(data []byte) bool {
@@ -417,63 +463,62 @@ func autoreplyParseNeedVcode(data []byte) bool {
 		}
 		pos = newPos
 		fieldNumber := int(tag >> 3)
-		wireType := byte(tag & 0x07)
-
+		wireType := int(tag & 0x07)
 		if wireType == 0 {
-			_, newPos, ok := autoreplyReadVarint(data, pos)
+			_, np, ok := autoreplyReadVarint(data, pos)
 			if !ok {
 				break
 			}
-			pos = newPos
+			pos = np
 		} else if wireType == 2 {
-			length, newPos, ok := autoreplyReadVarint(data, pos)
+			length, np, ok := autoreplyReadVarint(data, pos)
 			if !ok {
 				break
 			}
-			pos = newPos
-
+			pos = np
+			end := pos + int(length)
+			if end > len(data) {
+				break
+			}
 			if fieldNumber == 14 {
-				// PostAntiInfo message
-				subData := data[pos : pos+int(length)]
-				sPos := 0
-				for sPos < len(subData) {
-					sTag, sNewPos, ok := autoreplyReadVarint(subData, sPos)
+				spos := 0
+				for spos < end-pos {
+					stag, snp, ok := autoreplyReadVarint(data[pos:end], spos)
 					if !ok {
 						break
 					}
-					sPos = sNewPos
-					sField := int(sTag >> 3)
-					sWire := byte(sTag & 0x07)
-
-					if sWire == 2 && sField == 3 {
-						sLen, sNewPos2, ok := autoreplyReadVarint(subData, sPos)
+					spos = snp
+					sfield := int(stag >> 3)
+					swire := int(stag & 0x07)
+					if swire == 2 && sfield == 3 {
+						slen, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
 						if ok {
-							sPos = sNewPos2
-							if sPos+int(sLen) <= len(subData) {
-								needVcodeValue := string(subData[sPos : sPos+int(sLen)])
-								needVcode = needVcodeValue != "0"
+							spos = snp2
+							vend := spos + int(slen)
+							if vend <= end-pos {
+								v := string(data[pos+spos : pos+vend])
+								needVcode = v != "" && v != "0"
 							}
 						}
 						break
-					} else if sWire == 0 {
-						_, sNewPos2, ok := autoreplyReadVarint(subData, sPos)
+					} else if swire == 0 {
+						_, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
 						if !ok {
 							break
 						}
-						sPos = sNewPos2
-					} else if sWire == 2 {
-						sLen, sNewPos2, ok := autoreplyReadVarint(subData, sPos)
+						spos = snp2
+					} else if swire == 2 {
+						slen, snp2, ok := autoreplyReadVarint(data[pos:end], spos)
 						if !ok {
 							break
 						}
-						sPos = sNewPos2 + int(sLen)
+						spos = snp2 + int(slen)
 					} else {
 						break
 					}
 				}
 			}
-
-			pos += int(length)
+			pos = end
 		} else {
 			break
 		}
@@ -481,73 +526,348 @@ func autoreplyParseNeedVcode(data []byte) bool {
 	return needVcode
 }
 
-func autoreplyParseResponse(binaryData []byte) autoreplyParseResult {
-	rawDebug := hex.EncodeToString(binaryData)
-	if len(rawDebug) > 256 {
-		rawDebug = rawDebug[:256]
+func autoreplySkipField(data []byte, pos, wireType int) int {
+	switch wireType {
+	case 0:
+		_, np, ok := autoreplyReadVarint(data, pos)
+		if !ok {
+			return -1
+		}
+		return np
+	case 1:
+		return pos + 8
+	case 2:
+		length, np, ok := autoreplyReadVarint(data, pos)
+		if !ok {
+			return -1
+		}
+		return np + int(length)
+	case 5:
+		return pos + 4
 	}
+	return -1
+}
 
-	errorNo := 0
-	errMsg := ""
-	needVcode := false
-
+func autoreplyParseResponse(binary []byte) (errorno int, errmsg string, needVcode bool) {
 	pos := 0
-	for pos < len(binaryData) {
-		tag, newPos, ok := autoreplyReadVarint(binaryData, pos)
+	for pos < len(binary) {
+		tag, newPos, ok := autoreplyReadVarint(binary, pos)
 		if !ok {
 			break
 		}
 		pos = newPos
 		fieldNumber := int(tag >> 3)
-		wireType := byte(tag & 0x07)
-
-		if wireType == 0 {
-			_, newPos, ok := autoreplyReadVarint(binaryData, pos)
+		wireType := int(tag & 0x07)
+		switch wireType {
+		case 0:
+			_, np, ok := autoreplyReadVarint(binary, pos)
 			if !ok {
-				break
+				return
 			}
-			pos = newPos
-		} else if wireType == 1 {
+			pos = np
+		case 1:
 			pos += 8
-		} else if wireType == 2 {
-			length, newPos, ok := autoreplyReadVarint(binaryData, pos)
+		case 2:
+			length, np, ok := autoreplyReadVarint(binary, pos)
 			if !ok {
-				break
+				return
 			}
-			pos = newPos
-			if pos+int(length) <= len(binaryData) {
-				subData := binaryData[pos : pos+int(length)]
-				if fieldNumber == 1 {
-					errorNo, errMsg = autoreplyParseError(subData)
-				} else if fieldNumber == 2 {
-					needVcode = autoreplyParseNeedVcode(subData)
-				}
+			pos = np
+			end := pos + int(length)
+			if end > len(binary) {
+				return
 			}
-			pos += int(length)
-		} else if wireType == 5 {
+			sub := binary[pos:end]
+			if fieldNumber == 1 {
+				errorno, errmsg = autoreplyParseError(sub)
+			} else if fieldNumber == 2 {
+				needVcode = autoreplyParseNeedVcode(sub)
+			}
+			pos = end
+		case 5:
 			pos += 4
-		} else {
-			break
+		default:
+			return
 		}
 	}
+	return
+}
 
-	return autoreplyParseResult{
-		ErrorNo:   errorNo,
-		ErrorMsg:  errMsg,
+type autoreplyAddPostResult struct {
+	Success   bool   `json:"success"`
+	ErrorCode int    `json:"error_code"`
+	ErrorMsg  string `json:"error_msg"`
+	NeedVcode bool   `json:"need_vcode"`
+}
+
+func autoreplyIsTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
+// autoreplyIsRetryableErr 判断错误是否值得重试（网络抖动、连接重置等瞬态错误）
+func autoreplyIsRetryableErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if autoreplyIsTimeout(err) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	s := err.Error()
+	if strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "i/o timeout") ||
+		strings.Contains(s, "no such host") ||
+		strings.Contains(s, "server closed connection") {
+		return true
+	}
+	return false
+}
+
+func autoreplyDoWithRetry(ctx context.Context, timeout time.Duration, do func(context.Context) (*http.Response, error)) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * 500 * time.Millisecond
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				if lastErr != nil {
+					return nil, lastErr
+				}
+				return nil, ctx.Err()
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		resp, err := do(attemptCtx)
+		cancel()
+		if err == nil {
+			// 429 Too Many Requests 和 5xx 服务端错误值得重试
+			if resp.StatusCode == 429 || (resp.StatusCode >= 500 && resp.StatusCode < 600) {
+				lastErr = fmt.Errorf("server returned status %d", resp.StatusCode)
+				resp.Body.Close()
+				continue
+			}
+			return resp, nil
+		}
+		lastErr = err
+		if !autoreplyIsRetryableErr(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+func autoreplyAddPost(bduss, stoken, tbs, fname string, fid, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) autoreplyAddPostResult {
+	protoBinary := autoreplyBuildPostProto(bduss, stoken, tbs, fname, fid, tid, content, showName, quoteID, replyUID, floorNum, subPostID)
+
+	boundary := "-*_r1999"
+	var body bytes.Buffer
+	body.WriteString("--" + boundary + "\r\n")
+	body.WriteString("Content-Disposition: form-data; name=\"data\"; filename=\"file\"\r\n\r\n")
+	body.Write(protoBinary)
+	body.WriteString("\r\n--" + boundary + "--\r\n")
+
+	targetURL := "https://tiebac.baidu.com/c/c/post/add?cmd=309731"
+	ctx := context.Background()
+
+	do := func(reqCtx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(body.Bytes()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+		req.Header.Set("User-Agent", "tieba/12.35.1.0")
+		req.Header.Set("x_bd_data_type", "protobuf")
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Cookie", "BDUSS="+bduss+"; STOKEN="+stoken+";")
+
+		client := &http.Client{
+			Timeout:   60 * time.Second,
+			Transport: _function.TBClient.Transport,
+		}
+		return client.Do(req)
+	}
+
+	resp, err := autoreplyDoWithRetry(ctx, 60*time.Second, do)
+	if err != nil {
+		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "CURL Error: " + err.Error()}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var raw bytes.Buffer
+		io.CopyN(&raw, resp.Body, 512)
+		errMsg := "HTTP Error: " + strconv.Itoa(resp.StatusCode)
+		if raw.Len() > 0 {
+			errMsg += " body: " + raw.String()
+		}
+		return autoreplyAddPostResult{Success: false, ErrorCode: resp.StatusCode, ErrorMsg: errMsg}
+	}
+
+	var reader io.Reader = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gr, err := gzip.NewReader(reader)
+		if err == nil {
+			defer gr.Close()
+			reader = gr
+		}
+	}
+	response, err := io.ReadAll(reader)
+	if err != nil {
+		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "Read Error: " + err.Error()}
+	}
+	if len(response) == 0 {
+		return autoreplyAddPostResult{Success: false, ErrorCode: -1, ErrorMsg: "empty response body"}
+	}
+
+	errorno, errmsg, needVcode := autoreplyParseResponse(response)
+	return autoreplyAddPostResult{
+		Success:   errorno == 0,
+		ErrorCode: errorno,
+		ErrorMsg:  errmsg,
 		NeedVcode: needVcode,
-		RawDebug:  rawDebug,
 	}
 }
 
-// ============================================================
-// Tieba JSON API
-// ============================================================
+type weltolkFloor struct {
+	ID       int64           `json:"id"`
+	AuthorID int64           `json:"author_id"`
+	Floor    int64           `json:"floor"`
+	Username string          `json:"username"`
+	Portrait string          `json:"portrait"`
+	Content  string          `json:"content"`
+	SubPosts []*weltolkFloor `json:"sub_posts"`
+}
+
+func weltolkToInt64(v any) int64 {
+	switch x := v.(type) {
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i
+		}
+	case string:
+		if i, err := strconv.ParseInt(x, 10, 64); err == nil {
+			return i
+		}
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case int32:
+		return int64(x)
+	case int:
+		return int64(x)
+	}
+	return 0
+}
+
+func weltolkToString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case json.Number:
+		return x.String()
+	case float64:
+		return strconv.FormatInt(int64(x), 10)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case int:
+		return strconv.Itoa(x)
+	}
+	return ""
+}
+
+func weltolkExtractTextContent(content any) string {
+	arr, ok := content.([]any)
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeVal := m["type"]
+		if typeVal == nil {
+			continue
+		}
+		match := false
+		switch t := typeVal.(type) {
+		case json.Number:
+			if t.String() == "0" {
+				match = true
+			}
+		case float64:
+			if int64(t) == 0 {
+				match = true
+			}
+		case int, int32, int64:
+			if weltolkToInt64(t) == 0 {
+				match = true
+			}
+		case string:
+			if t == "0" {
+				match = true
+			}
+		}
+		if match {
+			sb.WriteString(weltolkToString(m["text"]))
+		}
+	}
+	return sb.String()
+}
+
+func weltolkParseAuthorName(author any, authorID int64) string {
+	m, ok := author.(map[string]any)
+	if !ok {
+		if authorID != 0 {
+			return fmt.Sprintf("用户%d", authorID)
+		}
+		return ""
+	}
+	if v := weltolkToString(m["name_show"]); v != "" {
+		return v
+	}
+	if v := weltolkToString(m["name"]); v != "" {
+		return v
+	}
+	if authorID != 0 {
+		return fmt.Sprintf("用户%d", authorID)
+	}
+	return ""
+}
 
 func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[string]any, error) {
 	secret := "tiebaclient!!!"
-	stTime := randomInt(100, 850)
-	stSize := int(float64(stTime) * (float64(randomInt(0, 2147483647))/float64(2147483647)*8 + 0.4))
-	cuid := "baidutiebaapp" + strconv.Itoa(randomInt(10000000, 99999999))
+	stTime := autoreplyRandIntn(751) + 100
+	stSize := int64(math.Round((float64(autoreplyRandInt63())/float64(math.MaxInt64)*8 + 0.4) * float64(stTime)))
+	cuid := fmt.Sprintf("baidutiebaapp%08d", autoreplyRandIntn(90000000)+10000000)
 
 	params := map[string]string{
 		"_client_type":    "2",
@@ -569,729 +889,621 @@ func weltolkCallTiebaJSONAPI(tid int64, bduss string, pn, rn, r string) (map[str
 		"stMode":          "1",
 		"stTimesNum":      "1",
 		"stTime":          strconv.Itoa(stTime),
-		"stSize":          strconv.Itoa(stSize),
+		"stSize":          strconv.FormatInt(stSize, 10),
 		"st_type":         "tb_frslist",
 		"with_floor":      "1",
 	}
 
-	// ksort + md5 sign
-	var keys []string
+	keys := make([]string, 0, len(params))
 	for k := range params {
 		keys = append(keys, k)
 	}
-	// sort keys
-	for i := 0; i < len(keys); i++ {
-		for j := i + 1; j < len(keys); j++ {
-			if keys[i] > keys[j] {
-				keys[i], keys[j] = keys[j], keys[i]
-			}
-		}
-	}
+	sort.Strings(keys)
 	var raw strings.Builder
 	for _, k := range keys {
 		raw.WriteString(k + "=" + params[k])
 	}
-	params["sign"] = strings.ToUpper(_function.Md5(raw.String() + secret))
+	params["sign"] = _function.Md5(raw.String() + secret)
 
-	// Build POST body
-	var body strings.Builder
-	first := true
-	for _, k := range keys {
-		if !first {
-			body.WriteByte('&')
-		}
-		first = false
-		body.WriteString(k + "=" + url.QueryEscape(params[k]))
+	body := url.Values{}
+	for k, v := range params {
+		body.Set(k, v)
 	}
-	body.WriteString("&sign=" + url.QueryEscape(params["sign"]))
 
 	headers := map[string]string{
 		"User-Agent": "bdtb for Android 12.41.7.1",
 		"Cookie":     "ka=open; BDUSS=" + url.QueryEscape(bduss),
 	}
 
-	resp, err := _function.TBFetch("http://c.tieba.baidu.com/c/f/pb/page", http.MethodPost, []byte(body.String()), headers)
+	ctx := context.Background()
+	targetURL := "http://c.tieba.baidu.com/c/f/pb/page"
+
+	do := func(reqCtx context.Context) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, strings.NewReader(body.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", headers["User-Agent"])
+		req.Header.Set("Cookie", headers["Cookie"])
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		client := &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: _function.TBClient.Transport,
+		}
+		return client.Do(req)
+	}
+
+	resp, err := autoreplyDoWithRetry(ctx, 15*time.Second, do)
 	if err != nil {
 		return nil, err
 	}
+	defer resp.Body.Close()
 
-	var result map[string]any
-	err = _function.JsonDecode(resp, &result)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if len(respBody) == 0 {
+		return nil, errors.New("empty response")
+	}
+
+	var result map[string]any
+	dec := json.NewDecoder(bytes.NewReader(respBody))
+	dec.UseNumber()
+	if err := dec.Decode(&result); err != nil {
+		return nil, err
+	}
+	// 检查贴吧 API 返回的业务错误码
+	if ec := weltolkToInt64(result["error_code"]); ec != 0 {
+		errMsg := weltolkToString(result["error_msg"])
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("error_code=%d", ec)
+		}
+		return result, fmt.Errorf("tieba api error: %s", errMsg)
 	}
 	return result, nil
 }
 
-// RandomInt helper - uses crypto/rand for secure random
-func randomInt(min, max int) int {
-	n := max - min + 1
-	if n <= 0 {
-		return min
+func weltolkGetReplyCount(tid int64, bduss string) (replyCount int64, totalPage int, ok bool) {
+	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", "1", "0")
+	if err != nil || resp == nil {
+		return 0, 0, false
 	}
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
-	v := int(binary.BigEndian.Uint32(b))
-	return min + (v % n)
+	thread, hasThread := resp["thread"].(map[string]any)
+	if !hasThread {
+		return 0, 0, false
+	}
+	v, hasReplyNum := thread["reply_num"]
+	if !hasReplyNum {
+		return 0, 0, false
+	}
+	replyCount = weltolkToInt64(v)
+	// 从 page 信息获取总页数（rn=1 时 total_page 即为帖子总数）
+	if page, ok := resp["page"].(map[string]any); ok {
+		totalPage = int(weltolkToInt64(page["total_page"]))
+	}
+	if totalPage < 1 {
+		totalPage = 1
+	}
+	return replyCount, totalPage, true
 }
 
-func weltolkGetReplyCount(tid int64, bduss string) (int, error) {
-	jsonData, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", "1", "0")
-	if err != nil {
-		return -1, err
-	}
-	thread, ok := jsonData["thread"].(map[string]any)
-	if !ok {
-		return -1, fmt.Errorf("no thread in response")
-	}
-	replyNum, ok := thread["reply_num"]
-	if !ok {
-		return -1, fmt.Errorf("no reply_num in thread")
-	}
-	switch v := replyNum.(type) {
-	case float64:
-		return int(v), nil
-	case string:
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return -1, err
+// weltolkGetLastFloorContent 获取帖子的最新楼层内容。
+// totalPostCount 为帖子总数（由 weltolkGetReplyCount 返回的 totalPage），
+// 用于计算最后一页的页码，确保获取的是最新楼层而非第一页的旧楼层。
+func weltolkGetLastFloorContent(tid int64, bduss string, limit, totalPostCount int) []*weltolkFloor {
+	// 根据帖子总数和每页大小计算最后一页的页码
+	pn := 1
+	if totalPostCount > 0 && limit > 0 {
+		pn = (totalPostCount + limit - 1) / limit
+		if pn < 1 {
+			pn = 1
 		}
-		return n, nil
-	default:
-		return -1, fmt.Errorf("unexpected reply_num type")
 	}
-}
-
-type autoreplyFloorInfo struct {
-	ID        any
-	AuthorID  any
-	Floor     any
-	Username  string
-	Portrait  string
-	Content   string
-	SubPosts  []autoreplySubPostInfo
-}
-
-type autoreplySubPostInfo struct {
-	ID        any
-	AuthorID  any
-	Username  string
-	Portrait  string
-	Content   string
-}
-
-func weltolkGetLastFloorContent(tid int64, bduss string, limit int) ([]autoreplyFloorInfo, error) {
-	jsonData, err := weltolkCallTiebaJSONAPI(tid, bduss, "1", strconv.Itoa(limit), "0")
-	if err != nil {
-		return nil, err
+	resp, err := weltolkCallTiebaJSONAPI(tid, bduss, strconv.Itoa(pn), strconv.Itoa(limit), "0")
+	if err != nil || resp == nil {
+		return nil
+	}
+	postListRaw, ok := resp["post_list"].([]any)
+	if !ok || len(postListRaw) == 0 {
+		return nil
 	}
 
-	postListRaw, ok := jsonData["post_list"]
-	if !ok {
-		return nil, nil
-	}
-
-	postList, ok := postListRaw.([]any)
-	if !ok {
-		return nil, nil
-	}
-
-	var result []autoreplyFloorInfo
-	for _, postRaw := range postList {
+	var result []*weltolkFloor
+	for _, postRaw := range postListRaw {
 		post, ok := postRaw.(map[string]any)
 		if !ok {
 			continue
 		}
-
-		authorID := post["author_id"]
+		authorID := weltolkToInt64(post["author_id"])
 		username := ""
-		if authorID != nil {
-			username = fmt.Sprintf("用户%v", authorID)
+		portrait := ""
+		if authorID != 0 {
+			username = fmt.Sprintf("用户%d", authorID)
 		}
-
-		// extract content
-		content := ""
-		if contentArr, ok := post["content"].([]any); ok {
-			for _, cRaw := range contentArr {
-				c, ok := cRaw.(map[string]any)
-				if !ok {
-					continue
-				}
-				if cType, ok := c["type"].(float64); ok && cType == 0 {
-					if text, ok := c["text"].(string); ok {
-						content += text
-					}
-				}
+		if author, ok := post["author"].(map[string]any); ok {
+			portrait = weltolkToString(author["portrait"])
+			if n := weltolkParseAuthorName(author, authorID); n != "" {
+				username = n
 			}
 		}
 
-		// parse sub_posts
-		var subPosts []autoreplySubPostInfo
-		if subPostListRaw, ok := post["sub_post_list"].(map[string]any); ok {
-			if subListData, ok := subPostListRaw["sub_post_list"].([]any); ok {
-				for _, spRaw := range subListData {
+		floor := &weltolkFloor{
+			ID:       weltolkToInt64(post["id"]),
+			AuthorID: authorID,
+			Floor:    weltolkToInt64(post["floor"]),
+			Username: username,
+			Portrait: portrait,
+			Content:  weltolkExtractTextContent(post["content"]),
+		}
+
+		if splRaw, ok := post["sub_post_list"].(map[string]any); ok {
+			if subListRaw, ok := splRaw["sub_post_list"].([]any); ok {
+				for _, spRaw := range subListRaw {
 					sp, ok := spRaw.(map[string]any)
 					if !ok {
 						continue
 					}
-					spAuthorID := sp["author_id"]
+					spAuthorID := weltolkToInt64(sp["author_id"])
 					spUsername := ""
-					if spAuthorID != nil {
-						spUsername = fmt.Sprintf("用户%v", spAuthorID)
-					}
 					spPortrait := ""
-					if author, ok := sp["author"].(map[string]any); ok {
-						if p, ok := author["portrait"].(string); ok {
-							spPortrait = p
-						}
-						if nameShow, ok := author["name_show"].(string); ok && nameShow != "" {
-							spUsername = nameShow
-						} else if name, ok := author["name"].(string); ok && name != "" {
-							spUsername = name
-						}
+					if spAuthor, ok := sp["author"].(map[string]any); ok {
+						spPortrait = weltolkToString(spAuthor["portrait"])
+						spUsername = weltolkParseAuthorName(spAuthor, spAuthorID)
 					}
-					// extract sub post content
-					spContent := ""
-					if contentArr, ok := sp["content"].([]any); ok {
-						for _, cRaw := range contentArr {
-							c, ok := cRaw.(map[string]any)
-							if !ok {
-								continue
-							}
-							if cType, ok := c["type"].(float64); ok && cType == 0 {
-								if text, ok := c["text"].(string); ok {
-									spContent += text
-								}
-							}
-						}
+					if spUsername == "" && spAuthorID != 0 {
+						spUsername = fmt.Sprintf("用户%d", spAuthorID)
 					}
-					subPosts = append(subPosts, autoreplySubPostInfo{
-						ID:       sp["id"],
+					floor.SubPosts = append(floor.SubPosts, &weltolkFloor{
+						ID:       weltolkToInt64(sp["id"]),
 						AuthorID: spAuthorID,
 						Username: spUsername,
 						Portrait: spPortrait,
-						Content:  spContent,
+						Content:  weltolkExtractTextContent(sp["content"]),
 					})
 				}
 			}
 		}
-
-		result = append(result, autoreplyFloorInfo{
-			ID:       post["id"],
-			AuthorID: authorID,
-			Floor:    post["floor"],
-			Username: username,
-			Portrait: "",
-			Content:  content,
-			SubPosts: subPosts,
-		})
+		result = append(result, floor)
 	}
-
-	return result, nil
+	return result
 }
 
-// ============================================================
-// Add Post API
-// ============================================================
-
-type autoreplyAddPostResult struct {
-	Success   bool
-	ErrorCode int
-	ErrorMsg  string
-	NeedVcode bool
-	RawDebug  string
-}
-
-func autoreplyAddPost(bduss, stoken, tbs, fname string, fid int64, tid int64, content, showName, quoteID, replyUID, floorNum, subPostID string) autoreplyAddPostResult {
-	// 1. Build protobuf
-	protoBinary := autoreplyBuildPostProto(bduss, stoken, tbs, fname, fid, tid, content, showName, quoteID, replyUID, floorNum, subPostID)
-
-	// 2. Build multipart body
-	boundary := "-*_r1999"
-	var body bytes.Buffer
-	body.WriteString("--" + boundary + "\r\n")
-	body.WriteString("Content-Disposition: form-data; name=\"data\"; filename=\"file\"\r\n")
-	body.WriteString("\r\n")
-	body.Write(protoBinary)
-	body.WriteString("\r\n")
-	body.WriteString("--" + boundary + "--\r\n")
-
-	// 3. POST
-	reqURL := "https://tiebac.baidu.com/c/c/post/add?cmd=309731"
-	headers := map[string]string{
-		"Content-Type":   "multipart/form-data; boundary=" + boundary,
-		"User-Agent":     "tieba/12.35.1.0",
-		"x_bd_data_type": "protobuf",
-		"Accept-Encoding": "gzip",
-		"Connection":      "keep-alive",
-		"Cookie":          "BDUSS=" + bduss + "; STOKEN=" + stoken + ";",
-	}
-
-	resp, err := _function.TBFetch(reqURL, http.MethodPost, body.Bytes(), headers)
-	if err != nil {
-		return autoreplyAddPostResult{
-			Success:   false,
-			ErrorCode: -1,
-			ErrorMsg:  "请求失败: " + err.Error(),
-			NeedVcode: false,
-			RawDebug:  "",
-		}
-	}
-
-	// 4. Parse protobuf response
-	parsed := autoreplyParseResponse(resp)
-
-	success := parsed.ErrorNo == 0
-	return autoreplyAddPostResult{
-		Success:   success,
-		ErrorCode: parsed.ErrorNo,
-		ErrorMsg:  parsed.ErrorMsg,
-		NeedVcode: parsed.NeedVcode,
-		RawDebug:  parsed.RawDebug,
-	}
-}
-
-// ============================================================
-// Action - cron logic
-// ============================================================
-
-func (pluginInfo *WeltolkAutoreplyPluginType) Action() {
+func (pluginInfo *WeltolkAutoReplyPluginType) Action() {
 	if !pluginInfo.PluginInfo.CheckActive() {
 		return
 	}
 	defer pluginInfo.PluginInfo.SetActive(false)
 
-	now := int(time.Now().Unix())
-	logTime := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().Unix()
+	logTime := weltolkAutoreplyNowString(now)
 
-	// High water mark for checkpoint resumption
-	highWater, err := strconv.ParseInt(_function.GetOption("weltolk_autoreply_id"), 10, 64)
-	if err != nil {
+	// 按 UID 分组处理任务，每个用户独立高水位，避免互相影响
+	uidList := []string{}
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ?", 1).Distinct("uid").Pluck("uid", &uidList).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.action.uid-list", "error", err)
+		return
+	}
+
+	for _, uid := range uidList {
+		weltolkAutoreplyProcessUser(uid, now, logTime)
+	}
+}
+
+func weltolkAutoreplyProcessUser(uid string, now int64, logTime string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("plugin.weltolk-autoreply.action.panic", "uid", uid, "recover", r)
+		}
+	}()
+
+	highWaterKey := weltolkAutoreplyHighWaterKey + "_" + uid
+	highWater, _ := strconv.Atoi(_function.GetOption(highWaterKey))
+	if highWater < 0 {
 		highWater = 0
 	}
 
-	// Query enabled tasks
-	var taskList []*model.TcWeltolkAutoreplyTasks
-	query := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = 1")
-	if highWater > 0 {
-		query = query.Where("id >= ?", highWater)
+	var tasks []*model.TcWeltolkAutoreplyTasks
+	err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ? AND uid = ? AND id >= ?", 1, uid, highWater).Order("id ASC").Find(&tasks).Error
+	if err != nil {
+		slog.Error("plugin.weltolk-autoreply.action.query", "uid", uid, "error", err)
+		return
 	}
-	query.Order("id ASC").Find(&taskList)
-
-	// If no tasks found, reset high water and try from beginning
-	if len(taskList) == 0 {
-		_function.SetOption("weltolk_autoreply_id", "0")
-		_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = 1").Order("id ASC").Find(&taskList)
-	}
-
-	for _, task := range taskList {
-		// Initialize context variables
-		atUsername := ""
-		atPortrait := ""
-		quoteID := ""
-		replyUID := ""
-		floorNum := ""
-		subPostID := ""
-		keywordMaxSeenPid := int64(0)
-
-		// Skip if reply_content is empty
-		if task.ReplyContent == "" {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"last_status":    "skipped",
-				"last_error":     "",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：回复内容为空<br>"),
-			})
-			continue
+	if len(tasks) == 0 {
+		_function.SetOption(highWaterKey, 0)
+		err = _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("enabled = ? AND uid = ?", 1, uid).Order("id ASC").Find(&tasks).Error
+		if err != nil {
+			slog.Error("plugin.weltolk-autoreply.action.query2", "uid", uid, "error", err)
+			return
 		}
-
-		// Step 1: Get BDUSS from tc_baiduid by pid
-		pid := task.Pid
-		if pid == 0 {
-			// Fallback: find first baiduid for this uid
-			var baiduid model.TcBaiduid
-			_function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Take(&baiduid)
-			if baiduid.ID == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            0,
-					"last_status":    "error",
-					"last_error":     "未找到贴吧绑定信息",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：未找到贴吧绑定信息<br>"),
-				})
-				continue
-			}
-			pid = int(baiduid.ID)
-		}
-
-		cookie := _function.GetCookie(int32(pid), true)
-		if !cookie.IsLogin || cookie.Bduss == "" {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":            pid,
-				"last_status":    "error",
-				"last_error":     "未获取到BDUSS",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：未获取到BDUSS<br>"),
-			})
-			continue
-		}
-
-		// Step 2: Get reply count
-		replyCount, err := weltolkGetReplyCount(task.Tid, cookie.Bduss)
-		if err != nil || replyCount < 0 {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":            pid,
-				"last_status":    "error",
-				"last_error":     "获取回复数失败",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：获取回复数失败<br>"),
-			})
-			continue
-		}
-
-		// Step 3: Check for new replies
-		if task.TriggerMode != "keyword" {
-			// new_floor mode
-			latestFloors, err := weltolkGetLastFloorContent(task.Tid, cookie.Bduss, 1)
-			latestPid := int64(0)
-			if err == nil && len(latestFloors) > 0 {
-				latestPid = toInt64(latestFloors[0].ID)
-			}
-			if task.AllowReplied == 0 && latestPid <= task.LastRepliedPid {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            pid,
-					"last_status":    "skipped",
-					"last_error":     "",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：没有新楼层<br>"),
-				})
-				continue
-			}
-			if len(latestFloors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            pid,
-					"last_status":    "error",
-					"last_error":     "获取楼层内容失败",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：获取楼层内容失败<br>"),
-				})
-				continue
-			}
-			latest := latestFloors[0]
-			quoteID = toString(latest.ID)
-			replyUID = toString(latest.AuthorID)
-			floorNum = toString(latest.Floor)
-			atUsername = latest.Username
-			atPortrait = latest.Portrait
-			subPostID = ""
-		}
-
-		// keyword mode
-		if task.TriggerMode == "keyword" {
-			atUsername = ""
-			atPortrait = ""
-			quoteID = ""
-			replyUID = ""
-			floorNum = ""
-			subPostID = ""
-
-			floors, err := weltolkGetLastFloorContent(task.Tid, cookie.Bduss, 20)
-			if err != nil || len(floors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            pid,
-					"last_status":    "skipped",
-					"last_error":     "获取楼层内容失败",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：获取楼层内容失败<br>"),
-				})
-				continue
-			}
-
-			// Calculate max pid for water mark advancement
-			for _, floor := range floors {
-				floorID := toInt64(floor.ID)
-				if floorID > keywordMaxSeenPid {
-					keywordMaxSeenPid = floorID
-				}
-			}
-
-			// Filter new floors
-			var newFloors []autoreplyFloorInfo
-			for _, floor := range floors {
-				floorID := toInt64(floor.ID)
-				if task.AllowReplied == 1 || floorID > task.LastRepliedPid {
-					newFloors = append(newFloors, floor)
-				}
-			}
-
-			if len(newFloors) == 0 {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            pid,
-					"last_status":    "skipped",
-					"last_error":     "",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：无新楼层<br>"),
-				})
-				continue
-			}
-
-			// Keyword matching
-			matched := false
-			if strings.TrimSpace(task.MatchKeywords) != "" {
-				keywords := strings.Split(task.MatchKeywords, "\n")
-				for _, floor := range newFloors {
-					floorContent := floor.Content
-					if floorContent == "" {
-						continue
-					}
-					for _, kw := range keywords {
-						kw = strings.TrimSpace(kw)
-						if kw == "" {
-							continue
-						}
-						if strings.Contains(strings.ToLower(floorContent), strings.ToLower(kw)) {
-							matched = true
-							quoteID = toString(floor.ID)
-							floorNum = toString(floor.Floor)
-
-							// Subpost reply mode
-							if task.ReplyTarget == "subpost" && len(floor.SubPosts) > 0 {
-								subMatched := false
-								for _, sp := range floor.SubPosts {
-									spContent := sp.Content
-									if spContent != "" && strings.Contains(strings.ToLower(spContent), strings.ToLower(kw)) {
-										subPostID = toString(sp.ID)
-										replyUID = toString(sp.AuthorID)
-										atUsername = sp.Username
-										atPortrait = sp.Portrait
-										subMatched = true
-										break
-									}
-								}
-								if !subMatched {
-									subPostID = ""
-									atUsername = floor.Username
-									atPortrait = floor.Portrait
-									replyUID = toString(floor.AuthorID)
-								}
-							} else {
-								subPostID = ""
-								atUsername = floor.Username
-								atPortrait = floor.Portrait
-								replyUID = toString(floor.AuthorID)
-							}
-							break
-						}
-					}
-					if matched {
-						break
-					}
-				}
-			}
-
-			if !matched {
-				// Keywords not matched - advance water mark
-				newLastRepliedPid := task.LastRepliedPid
-				if task.AllowReplied != 1 {
-					newLastRepliedPid = keywordMaxSeenPid
-				}
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":             pid,
-					"last_replied_pid": newLastRepliedPid,
-					"last_status":     "skipped",
-					"last_error":      "",
-					"last_check_time": now,
-					"log":             gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：关键词未匹配（水位推进至"+strconv.FormatInt(keywordMaxSeenPid, 10)+"）<br>"),
-				})
-				continue
-			}
-		}
-
-		// Step 4: Check reply interval
-		elapsed := now - task.LastReplyTime
-		if task.LastReplyTime > 0 && elapsed < task.ReplyInterval {
-			remaining := task.ReplyInterval - elapsed
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":            pid,
-				"last_status":    "skipped",
-				"last_error":     "",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：回复间隔未到（需等待 "+strconv.Itoa(remaining)+" 秒）<br>"),
-			})
-			continue
-		}
-
-		// Step 5: Check reply probability
-		if task.ReplyProbability < 100 {
-			randVal := randomInt(1, 100)
-			if randVal > task.ReplyProbability {
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":            pid,
-					"last_status":    "skipped",
-					"last_error":     "",
-					"last_check_time": now,
-					"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：概率未命中<br>"),
-				})
-				continue
-			}
-		}
-
-		// Step 6: Get TBS
-		cookieFull := _function.GetCookie(int32(pid))
-		if !cookieFull.IsLogin || cookieFull.Tbs == "" {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":            pid,
-				"last_status":    "error",
-				"last_error":     "获取TBS失败",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：获取TBS失败<br>"),
-			})
-			continue
-		}
-		tbs := cookieFull.Tbs
-
-		// Step 7: Get FID
-		fid := _function.GetFid(task.Fname)
-		if fid == 0 {
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":            pid,
-				"last_status":    "error",
-				"last_error":     "获取fid失败",
-				"last_check_time": now,
-				"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：获取fid失败<br>"),
-			})
-			continue
-		}
-
-		// Step 8: Variable replacement
-		floorForReplace := strconv.Itoa(replyCount)
-		if task.TriggerMode == "keyword" && floorNum != "" {
-			floorForReplace = floorNum
-		}
-		finalContent := task.ReplyContent
-		finalContent = strings.ReplaceAll(finalContent, "{floor}", floorForReplace)
-		finalContent = strings.ReplaceAll(finalContent, "{time}", time.Now().Format("2006-01-02 15:04:05"))
-		finalContent = strings.ReplaceAll(finalContent, "{date}", time.Now().Format("2006-01-02"))
-		finalContent = strings.ReplaceAll(finalContent, "{tid}", strconv.FormatInt(task.Tid, 10))
-		finalContent = strings.ReplaceAll(finalContent, "{username}", atUsername)
-
-		// Subpost prefix for keyword+subpost mode
-		if task.TriggerMode == "keyword" && task.ReplyTarget == "subpost" && subPostID != "" && atUsername != "" {
-			finalContent = "回复 #(reply, " + atPortrait + ", " + atUsername + ") :" + finalContent
-		}
-
-		// Step 9: Execute reply
-		showName := "贴吧用户"
-		result := autoreplyAddPost(cookieFull.Bduss, cookieFull.Stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
-
-		if result.Success {
-			// Success
-			newLastRepliedPid := task.LastRepliedPid
-			if task.AllowReplied != 1 {
-				if task.TriggerMode == "keyword" {
-					newLastRepliedPid = keywordMaxSeenPid
-				} else {
-					newLastRepliedPid = toInt64FromStr(quoteID)
-				}
-			}
-			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-				"pid":             pid,
-				"last_floor":      replyCount,
-				"last_replied_pid": newLastRepliedPid,
-				"last_reply_time": now,
-				"retry_count":     0,
-				"last_status":     "ok",
-				"last_error":      "",
-				"last_check_time": now,
-				"log":             gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：操作成功<br>"),
-			})
-		} else {
-			if result.NeedVcode {
-				// Vcode - don't increase retry count
-				vcodeNewPid := task.LastRepliedPid
-				if task.AllowReplied != 1 {
-					if task.TriggerMode == "keyword" {
-						vcodeNewPid = keywordMaxSeenPid
-					} else {
-						vcodeNewPid = toInt64FromStr(quoteID)
-					}
-				}
-				_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-					"pid":             pid,
-					"last_floor":      replyCount,
-					"last_replied_pid": vcodeNewPid,
-					"last_status":     "vcode",
-					"last_error":      "触发验证码",
-					"last_check_time": now,
-					"log":             gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", "["+logTime+"] 执行结果：跳过：触发验证码<br>"),
-				})
-			} else {
-				// Error - increase retry count
-				newRetry := task.RetryCount + 1
-				if newRetry >= 3 {
-					_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-						"pid":            pid,
-						"last_floor":     replyCount,
-						"retry_count":    newRetry,
-						"enabled":        0,
-						"last_status":    "error",
-						"last_error":     fmt.Sprintf("重试次数达上限: [%d] %s", result.ErrorCode, result.ErrorMsg),
-						"last_check_time": now,
-						"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", fmt.Sprintf("[%s] 执行结果：失败：重试次数达上限，任务已禁用#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg)),
-					})
-				} else {
-					_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", task.ID).Updates(map[string]any{
-						"pid":            pid,
-						"last_floor":     replyCount,
-						"retry_count":    newRetry,
-						"last_status":    "error",
-						"last_error":     fmt.Sprintf("[错误码 %d]%s", result.ErrorCode, result.ErrorMsg),
-						"last_check_time": now,
-						"log":            gorm.Expr("CONCAT(COALESCE(`log`, ''), ?)", fmt.Sprintf("[%s] 执行结果：操作失败#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg)),
-					})
-				}
-			}
-		}
-
-		// Advance high water mark
-		_function.SetOption("weltolk_autoreply_id", strconv.Itoa(int(task.ID)+1))
 	}
 
-	// Reset high water mark after full pass
-	_function.SetOption("weltolk_autoreply_id", "0")
+	// 顺序执行：每个用户每分钟只执行1个任务，避免短时间内大量回复
+	// 跳过的任务推进水位，执行了的任务推进水位并结束
+	for _, task := range tasks {
+		weltolkAutoreplyProcessTask(task, now, logTime, highWaterKey)
+		// 每个用户每轮只真正执行1个任务（内部会break）
+		break
+	}
 }
 
-// ============================================================
-// Lifecycle methods
-// ============================================================
+func weltolkAutoreplyProcessTask(task *model.TcWeltolkAutoreplyTasks, now int64, logTime, highWaterKey string) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("plugin.weltolk-autoreply.task.panic", "id", task.ID, "recover", r)
+			_function.SetOption(highWaterKey, int(task.ID)+1)
+		}
+	}()
 
-func (pluginInfo *WeltolkAutoreplyPluginType) Install() error {
+	atUsername := ""
+	atPortrait := ""
+	quoteID := ""
+	replyUID := ""
+	floorNum := ""
+	subPostID := ""
+	taskID := task.ID
+
+	slog.Debug("plugin.weltolk-autoreply.action.task", "id", taskID, "fname", task.Fname, "tid", task.Tid)
+
+	if strings.TrimSpace(task.ReplyContent) == "" && strings.TrimSpace(task.ReplyContentList) == "" {
+		slog.Debug("plugin.weltolk-autoreply.action.skip-empty", "id", taskID)
+		weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "skipped", "回复内容为空", "执行结果：跳过：回复内容为空")
+		return
+	}
+
+	// 活跃时间窗口检查
+	if task.ActiveTimeStart != "" && task.ActiveTimeEnd != "" {
+		nowTime := time.Now().Format("15:04")
+		inWindow := false
+		if task.ActiveTimeStart <= task.ActiveTimeEnd {
+			inWindow = nowTime >= task.ActiveTimeStart && nowTime < task.ActiveTimeEnd
+		} else {
+			inWindow = nowTime >= task.ActiveTimeStart || nowTime < task.ActiveTimeEnd
+		}
+		if !inWindow {
+			weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "skipped", "不在活跃时间段内", fmt.Sprintf("执行结果：跳过：不在活跃时间段内（%s-%s）", task.ActiveTimeStart, task.ActiveTimeEnd))
+			return
+		}
+	}
+
+	// 执行次数限制检查
+	if task.MaxCount > 0 && task.SuccessCount >= task.MaxCount {
+		weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "completed", "已达到最大执行次数", fmt.Sprintf("执行结果：已达到最大执行次数（%d/%d），任务已自动禁用", task.SuccessCount, task.MaxCount))
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("enabled", 0)
+		return
+	}
+
+	// 使用任务保存时指定的百度账号 pid，避免小号被覆盖成大号
+	pid := task.Pid
+	if pid <= 0 {
+		var bind model.TcBaiduid
+		if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("uid = ?", task.UID).Order("id ASC").Take(&bind).Error; err != nil {
+			slog.Debug("plugin.weltolk-autoreply.action.no-bind", "id", taskID, "uid", task.UID, "error", err)
+			weltolkAutoreplySkipTask(taskID, task.Pid, now, logTime, highWaterKey, "error", "未找到贴吧绑定信息", "执行结果：跳过：未找到贴吧绑定信息")
+			return
+		}
+		pid = bind.ID
+	}
+
+	// 回复间隔检查：使用 LastReplyTime + taskID 作为种子确保间隔稳定
+	// 避免每次 cron tick 重新随机导致间隔不断变化、任务可能永远无法执行
+	// 放在 API 调用之前，避免间隔未到时浪费贴吧 API 请求
+	intervalSeed := int64(task.LastReplyTime) + int64(taskID)
+	effectiveInterval := calcEffectiveInterval(task.ReplyIntervalMin, task.ReplyIntervalMax, task.ReplyInterval, intervalSeed)
+	if task.LastReplyTime > 0 && now-int64(task.LastReplyTime) < int64(effectiveInterval) {
+		remaining := effectiveInterval - int32(now-int64(task.LastReplyTime))
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", fmt.Sprintf("间隔未到（%d秒后）", remaining), fmt.Sprintf("执行结果：跳过：回复间隔未到（本次需等待 %d 秒，当前间隔设置 %d-%d 秒）", remaining, task.ReplyIntervalMin, task.ReplyIntervalMax))
+		return
+	}
+
+	if task.ReplyProbability < 100 {
+		r := autoreplyRandIntn(100) + 1
+		if r > int(task.ReplyProbability) {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "概率未命中", "执行结果：跳过：概率未命中")
+			return
+		}
+	}
+
+	cookie := _function.GetCookie(pid, true)
+	if cookie == nil || cookie.Bduss == "" {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "未获取到BDUSS", "执行结果：跳过：未获取到BDUSS")
+		return
+	}
+	bduss := cookie.Bduss
+	stoken := cookie.Stoken
+
+	replyCount, totalPage, ok := weltolkGetReplyCount(task.Tid, bduss)
+	if !ok || replyCount < 0 {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取回复数失败", "执行结果：跳过：获取回复数失败")
+		return
+	}
+
+	triggerMode := task.TriggerMode
+	if triggerMode == "" {
+		triggerMode = "new_floor"
+	}
+	replyTarget := task.ReplyTarget
+	if replyTarget == "" {
+		replyTarget = "floor"
+	}
+	allowReplied := task.AllowReplied == 1
+	keywordMaxSeenPid := int64(0)
+
+	if triggerMode != "keyword" {
+		latestFloors := weltolkGetLastFloorContent(task.Tid, bduss, 1, totalPage)
+		latestPid := int64(0)
+		if len(latestFloors) > 0 {
+			latestPid = latestFloors[0].ID
+		}
+		if !allowReplied && latestPid <= task.LastRepliedPid {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "没有新楼层", "执行结果：跳过：没有新楼层")
+			return
+		}
+		if len(latestFloors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
+			return
+		}
+		latest := latestFloors[0]
+		quoteID = strconv.FormatInt(latest.ID, 10)
+		replyUID = strconv.FormatInt(latest.AuthorID, 10)
+		floorNum = strconv.FormatInt(latest.Floor, 10)
+		atUsername = latest.Username
+		atPortrait = latest.Portrait
+		subPostID = ""
+	}
+
+	if triggerMode == "keyword" {
+		atUsername = ""
+		atPortrait = ""
+		quoteID = ""
+		replyUID = ""
+		floorNum = ""
+		subPostID = ""
+
+		floors := weltolkGetLastFloorContent(task.Tid, bduss, 20, totalPage)
+		if len(floors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "获取楼层内容失败", "执行结果：跳过：获取楼层内容失败")
+			return
+		}
+
+		for _, floor := range floors {
+			if floor.ID > keywordMaxSeenPid {
+				keywordMaxSeenPid = floor.ID
+			}
+		}
+
+		var newFloors []*weltolkFloor
+		for _, floor := range floors {
+			if allowReplied || floor.ID > task.LastRepliedPid {
+				newFloors = append(newFloors, floor)
+			}
+		}
+		if len(newFloors) == 0 {
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "无新楼层", "执行结果：跳过：无新楼层")
+			return
+		}
+
+		matched := false
+		keywords := strings.Split(task.MatchKeywords, "\n")
+		for _, floor := range newFloors {
+			if strings.TrimSpace(floor.Content) == "" {
+				continue
+			}
+			for _, kw := range keywords {
+				kw = strings.TrimSpace(kw)
+				if kw == "" {
+					continue
+				}
+				if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
+					matched = true
+					quoteID = strconv.FormatInt(floor.ID, 10)
+					floorNum = strconv.FormatInt(floor.Floor, 10)
+					atUsername = floor.Username
+					atPortrait = floor.Portrait
+					replyUID = strconv.FormatInt(floor.AuthorID, 10)
+
+					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
+						subMatched := false
+						for _, sp := range floor.SubPosts {
+							if strings.TrimSpace(sp.Content) == "" {
+								continue
+							}
+							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
+								subPostID = strconv.FormatInt(sp.ID, 10)
+								replyUID = strconv.FormatInt(sp.AuthorID, 10)
+								atUsername = sp.Username
+								atPortrait = sp.Portrait
+								subMatched = true
+								break
+							}
+						}
+						if !subMatched {
+							subPostID = ""
+							atUsername = floor.Username
+							atPortrait = floor.Portrait
+							replyUID = strconv.FormatInt(floor.AuthorID, 10)
+						}
+					} else {
+						subPostID = ""
+						atUsername = floor.Username
+						atPortrait = floor.Portrait
+						replyUID = strconv.FormatInt(floor.AuthorID, 10)
+					}
+					goto keywordMatched
+				}
+			}
+		}
+	keywordMatched:
+		if !matched {
+			newPid := task.LastRepliedPid
+			if !allowReplied {
+				newPid = keywordMaxSeenPid
+			}
+			weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "skipped", "关键词未匹配", fmt.Sprintf("执行结果：跳过：关键词未匹配（水位推进至%d）", keywordMaxSeenPid))
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Update("last_replied_pid", newPid)
+			return
+		}
+	}
+
+	tbsResp, err := _function.GetTbs(bduss)
+	if err != nil || tbsResp == nil || tbsResp.Tbs == "" {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取TBS失败", "执行结果：跳过：获取TBS失败")
+		return
+	}
+	tbs := tbsResp.Tbs
+
+	fid := _function.GetFid(task.Fname)
+	if fid == 0 {
+		weltolkAutoreplySkipTask(taskID, pid, now, logTime, highWaterKey, "error", "获取fid失败", "执行结果：跳过：获取fid失败")
+		return
+	}
+
+	// 随机选择回复内容
+	replyContent := task.ReplyContent
+	if task.ReplyContentList != "" {
+		lines := strings.Split(task.ReplyContentList, "\n")
+		var validLines []string
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				validLines = append(validLines, line)
+			}
+		}
+		if len(validLines) > 0 {
+			replyContent = validLines[autoreplyRandIntn(len(validLines))]
+		}
+	}
+
+	// {floor} 变量替换为实际楼层号，两种模式统一使用 floorNum
+	floorForReplace := floorNum
+	if floorForReplace == "" {
+		floorForReplace = strconv.FormatInt(replyCount, 10)
+	}
+	finalContent := strings.NewReplacer(
+		"{floor}", floorForReplace,
+		"{time}", time.Unix(now, 0).Format("2006-01-02 15:04:05"),
+		"{date}", time.Unix(now, 0).Format("2006-01-02"),
+		"{tid}", strconv.FormatInt(task.Tid, 10),
+		"{username}", atUsername,
+	).Replace(replyContent)
+
+	if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
+		finalContent = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, finalContent)
+	}
+
+	showName := "贴吧用户"
+	result := autoreplyAddPost(bduss, stoken, tbs, task.Fname, fid, task.Tid, finalContent, showName, quoteID, replyUID, floorNum, subPostID)
+
+	if result.Success {
+		newLastRepliedPid := task.LastRepliedPid
+		if !allowReplied {
+			if triggerMode == "keyword" {
+				newLastRepliedPid = keywordMaxSeenPid
+			} else {
+				newLastRepliedPid = weltolkToInt64(quoteID)
+			}
+		}
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+			"pid":              pid,
+			"last_floor":       replyCount,
+			"last_replied_pid": newLastRepliedPid,
+			"last_reply_time":  now,
+			"retry_count":      0,
+			"last_status":      "ok",
+			"last_error":       "",
+			"last_check_time":  now,
+			"success_count":    gorm.Expr("success_count + 1"),
+		})
+		// Check if max count reached after incrementing
+		if task.MaxCount > 0 && task.SuccessCount+1 >= task.MaxCount {
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"enabled":     0,
+				"last_status": "completed",
+				"last_error":  "已达到最大执行次数",
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：成功（已达到最大执行次数 %d/%d，任务已自动禁用）<br>", logTime, task.SuccessCount+1, task.MaxCount))
+		} else {
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作成功<br>", logTime))
+		}
+	} else if result.NeedVcode {
+		vcodePid := task.LastRepliedPid
+		if !allowReplied {
+			if triggerMode == "keyword" {
+				vcodePid = keywordMaxSeenPid
+			} else {
+				vcodePid = weltolkToInt64(quoteID)
+			}
+		}
+		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+			"pid":              pid,
+			"last_floor":       replyCount,
+			"last_replied_pid": vcodePid,
+			"last_status":      "vcode",
+			"last_error":       "触发验证码",
+			"last_check_time":  now,
+		})
+		weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：跳过：触发验证码<br>", logTime))
+	} else {
+		newRetry := task.RetryCount + 1
+		if newRetry >= 3 {
+			lastError := fmt.Sprintf("重试次数达上限: [%d] %s", result.ErrorCode, result.ErrorMsg)
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"pid":             pid,
+				"last_floor":      replyCount,
+				"retry_count":     newRetry,
+				"enabled":         0,
+				"last_status":     "error",
+				"last_error":      lastError,
+				"last_check_time": now,
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：失败：重试次数达上限，任务已禁用#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+		} else {
+			lastError := fmt.Sprintf("[错误码 %d] %s", result.ErrorCode, result.ErrorMsg)
+			_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", taskID).Updates(map[string]any{
+				"pid":             pid,
+				"last_floor":      replyCount,
+				"retry_count":     newRetry,
+				"last_status":     "error",
+				"last_error":      lastError,
+				"last_check_time": now,
+			})
+			weltolkAutoreplyAppendLog(taskID, fmt.Sprintf("[%s] 执行结果：操作失败#[%d] %s<br>", logTime, result.ErrorCode, result.ErrorMsg))
+		}
+	}
+
+	// 任务处理完成，推进高水位
+	_function.SetOption(highWaterKey, int(taskID)+1)
+}
+
+func (pluginInfo *WeltolkAutoReplyPluginType) Install() error {
+	var err error
 	for k, v := range pluginInfo.Options {
 		_function.SetOption(k, v)
 	}
-	UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
-	return _function.GormDB.W.Migrator().CreateTable(&model.TcWeltolkAutoreplyTasks{})
+	err = UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
+	if err != nil {
+		return err
+	}
+	// AutoMigrate 同时支持创建新表和添加新列，确保升级后新字段存在
+	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) Delete() error {
+func (pluginInfo *WeltolkAutoReplyPluginType) Delete() error {
 	for k := range pluginInfo.Options {
 		_function.DeleteOption(k)
 	}
 	DeletePluginInfo(pluginInfo.Name)
 	_function.GormDB.W.Migrator().DropTable(&model.TcWeltolkAutoreplyTasks{})
-
-	// clean user options
-	_function.GormDB.W.Where("name = ?", "weltolk_autoreply_open").Delete(&model.TcUsersOption{})
-	_function.GormDB.W.Where("name = ?", "weltolk_autoreply_limit").Delete(&model.TcUsersOption{})
-
+	_function.GormDB.W.Where("name = ?", weltolkAutoreplyLimitKey).Delete(&model.TcUsersOption{})
+	_function.GormDB.W.Where("name = ?", weltolkAutoreplyOpenKey).Delete(&model.TcUsersOption{})
 	return nil
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) Upgrade() error {
-	return nil
+func (pluginInfo *WeltolkAutoReplyPluginType) Upgrade() error {
+	return _function.GormDB.W.AutoMigrate(&model.TcWeltolkAutoreplyTasks{})
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
+func (pluginInfo *WeltolkAutoReplyPluginType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
 	_sql := _function.GormDB.W
 	if tx != nil {
 		_sql = tx
@@ -1299,11 +1511,11 @@ func (pluginInfo *WeltolkAutoreplyPluginType) RemoveAccount(_type string, id int
 	return _sql.Where(_type+" = ?", id).Delete(&model.TcWeltolkAutoreplyTasks{}).Error
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) Report(int32, *gorm.DB) (string, error) {
+func (pluginInfo *WeltolkAutoReplyPluginType) Report(int32, *gorm.DB) (string, error) {
 	return "", nil
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) Reset(uid, pid, tid int32) error {
+func (pluginInfo *WeltolkAutoReplyPluginType) Reset(uid, pid, tid int32) error {
 	if uid == 0 {
 		return errors.New("invalid uid")
 	}
@@ -1314,704 +1526,534 @@ func (pluginInfo *WeltolkAutoreplyPluginType) Reset(uid, pid, tid int32) error {
 	if tid != 0 {
 		_sql = _sql.Where("id = ?", tid)
 	}
-	return _sql.Update("last_reply_time", 0).Error
+	return _sql.Updates(map[string]any{
+		"enabled":     1,
+		"retry_count": 0,
+		"last_status": "",
+		"last_error":  "",
+	}).Error
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
+func (pluginInfo *WeltolkAutoReplyPluginType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
 	if !pluginInfo.GetSwitch() {
 		return nil, nil
 	}
-
+	tableName := (&model.TcWeltolkAutoreplyTasks{}).TableName()
+	var exportData []*model.TcWeltolkAutoreplyTasks
 	if tx == nil {
 		tx = _function.GormDB.R
 	}
-
-	var taskList []*model.TcWeltolkAutoreplyTasks
-	err := tx.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Find(&taskList).Error
-	if err != nil {
-		return nil, err
-	}
-
+	err := tx.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Find(&exportData).Error
 	return map[string]any{
-		(&model.TcWeltolkAutoreplyTasks{}).TableName(): taskList,
+		tableName: exportData,
 		"tc_users_options": _function.GetUserOptionBatch(strconv.Itoa(int(uid)), _function.OptionExt{
 			Tx:      tx,
-			KeyName: "weltolk_autoreply_open",
+			KeyName: weltolkAutoreplyLimitKey,
 		}),
-	}, nil
+	}, err
 }
 
-func (pluginInfo *WeltolkAutoreplyPluginType) ImportAccount(uid int32, pidMap map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
+func (pluginInfo *WeltolkAutoReplyPluginType) ImportAccount(uid int32, pid map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
 	if !pluginInfo.GetSwitch() {
 		return errors.New("plugin is not enabled")
 	}
-
 	if tx == nil {
 		tx = _function.GormDB.W
 	}
-
 	tableName := (&model.TcWeltolkAutoreplyTasks{}).TableName()
-
 	var data2 []*model.TcWeltolkAutoreplyTasks
 	if err := _function.JsonDecode(data[tableName], &data2); err != nil {
 		return errors.New("invalid data format")
 	}
-
 	var data3 []*model.TcWeltolkAutoreplyTasks
-
-	numLimit, _ := strconv.Atoi(_function.GetOption("weltolk_autoreply_limit"))
-
-	var existsAccountList []*model.TcWeltolkAutoreplyTasks
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Find(&existsAccountList)
-
-	count := len(existsAccountList)
-	remain := numLimit - count
-
 	for i := range data2 {
-		if newPid, ok := pidMap[int32(data2[i].Pid)]; ok {
-			if remain <= 0 {
-				break
-			}
-
-			var exists bool
-			for _, task := range existsAccountList {
-				if task.Pid == int(newPid) && task.Tid == data2[i].Tid && task.Fname == data2[i].Fname {
-					exists = true
-					break
-				}
-			}
-
-			if !exists {
-				data2[i].Pid = int(newPid)
-				data2[i].ID = 0
-				data2[i].UID = int(uid)
-
-				data3 = append(data3, data2[i])
-				remain--
-			}
+		if newPid, ok := pid[data2[i].Pid]; ok {
+			data2[i].ID = 0
+			data2[i].UID = uid
+			data2[i].Pid = newPid
+			data3 = append(data3, data2[i])
 		}
 	}
-
-	if len(data3) > 0 {
-		return tx.Model(&model.TcWeltolkAutoreplyTasks{}).Create(data3).Error
+	if len(data3) == 0 {
+		return nil
 	}
-
-	return nil
+	return tx.Model(&model.TcWeltolkAutoreplyTasks{}).Create(data3).Error
 }
 
-// ============================================================
-// API Endpoints
-// ============================================================
+// endpoints
 
-// switch GET
-func PluginWeltolkAutoreplyGetSwitch(c echo.Context) error {
+func PluginWeltolkAutoReplyGetSwitch(c echo.Context) error {
 	uid := c.Get("uid").(string)
-	status := _function.GetUserOption("weltolk_autoreply_open", uid)
+	status := _function.GetUserOption(weltolkAutoreplyOpenKey, uid)
 	if status == "" {
 		status = "0"
-		_function.SetUserOption("weltolk_autoreply_open", status, uid)
+		_function.SetUserOption(weltolkAutoreplyOpenKey, status, uid)
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", status != "0", "tbsign"))
 }
 
-// switch POST
-func PluginWeltolkAutoreplySwitch(c echo.Context) error {
+func PluginWeltolkAutoReplySwitch(c echo.Context) error {
 	uid := c.Get("uid").(string)
-	status := _function.GetUserOption("weltolk_autoreply_open", uid) != "0"
-
-	err := _function.SetUserOption("weltolk_autoreply_open", !status, uid)
+	status := _function.GetUserOption(weltolkAutoreplyOpenKey, uid) != "0"
+	err := _function.SetUserOption(weltolkAutoreplyOpenKey, !status, uid)
 	if err != nil {
 		slog.Debug("plugin.weltolk-autoreply.switch", "uid", uid, "current_status", status, "error", err)
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法启用自动回帖功能", status, "tbsign"))
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法修改自动回帖插件状态", status, "tbsign"))
 	}
 	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", !status, "tbsign"))
 }
 
-// list GET
-func PluginWeltolkAutoreplyGetList(c echo.Context) error {
+func PluginWeltolkAutoReplyList(c echo.Context) error {
 	uid := c.Get("uid").(string)
-
-	var taskList []*model.TcWeltolkAutoreplyTasks
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Order("id ASC").Find(&taskList)
-
-	numLimit, _ := strconv.Atoi(_function.GetOption("weltolk_autoreply_limit"))
-
-	type responseItem struct {
-		ID               uint   `json:"id"`
-		UID              int    `json:"uid"`
-		Pid              int    `json:"pid"`
-		Fname            string `json:"fname"`
-		Tid              int64  `json:"tid"`
-		LastFloor        int    `json:"last_floor"`
-		LastRepliedPid   int64  `json:"last_replied_pid"`
-		LastReplyTime    int    `json:"last_reply_time"`
-		LastStatus       string `json:"last_status"`
-		LastError        string `json:"last_error"`
-		LastCheckTime    int    `json:"last_check_time"`
-		Log              string `json:"log"`
-		ReplyContent     string `json:"reply_content"`
-		ReplyInterval    int    `json:"reply_interval"`
-		ReplyProbability int    `json:"reply_probability"`
-		Enabled          int8   `json:"enabled"`
-		RetryCount       int    `json:"retry_count"`
-		TriggerMode      string `json:"trigger_mode"`
-		ReplyTarget      string `json:"reply_target"`
-		AllowReplied     int8   `json:"allow_replied"`
-		MatchKeywords    string `json:"match_keywords"`
-	}
-
-	var responseList []responseItem
-	for _, v := range taskList {
-		responseList = append(responseList, responseItem{
-			ID:               v.ID,
-			UID:              v.UID,
-			Pid:              v.Pid,
-			Fname:            v.Fname,
-			Tid:              v.Tid,
-			LastFloor:        v.LastFloor,
-			LastRepliedPid:   v.LastRepliedPid,
-			LastReplyTime:    v.LastReplyTime,
-			LastStatus:       v.LastStatus,
-			LastError:        v.LastError,
-			LastCheckTime:    v.LastCheckTime,
-			Log:              v.Log,
-			ReplyContent:     v.ReplyContent,
-			ReplyInterval:    v.ReplyInterval,
-			ReplyProbability: v.ReplyProbability,
-			Enabled:          v.Enabled,
-			RetryCount:       v.RetryCount,
-			TriggerMode:      v.TriggerMode,
-			ReplyTarget:      v.ReplyTarget,
-			AllowReplied:     v.AllowReplied,
-			MatchKeywords:    v.MatchKeywords,
-		})
-	}
-
-	type listResponse struct {
-		Count int64          `json:"count"`
-		Limit int64          `json:"limit"`
-		List  []responseItem `json:"list"`
-	}
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", listResponse{
-		Count: int64(len(responseList)),
-		Limit: int64(numLimit),
-		List:  responseList,
+	var tasks []*model.TcWeltolkAutoreplyTasks
+	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Order("id DESC").Find(&tasks)
+	limit := weltolkAutoreplyGetUserLimit(uid)
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
+		"tasks": tasks,
+		"count": len(tasks),
+		"limit": limit,
 	}, "tbsign"))
 }
 
-// list PATCH - Add task
-func PluginWeltolkAutoreplyAddTask(c echo.Context) error {
+type weltolkAutoReplyListAddBinding struct {
+	Pid              int32  `json:"pid" form:"pid"`
+	Fname            string `json:"fname" form:"fname"`
+	Tid              int64  `json:"tid" form:"tid"`
+	ReplyContent     string `json:"reply_content" form:"reply_content"`
+	ReplyContentList string `json:"reply_content_list" form:"reply_content_list"`
+	ReplyInterval    int32  `json:"reply_interval" form:"reply_interval"`
+	ReplyIntervalMin int32  `json:"reply_interval_min" form:"reply_interval_min"`
+	ReplyIntervalMax int32  `json:"reply_interval_max" form:"reply_interval_max"`
+	ReplyProbability int32  `json:"reply_probability" form:"reply_probability"`
+	TriggerMode      string `json:"trigger_mode" form:"trigger_mode"`
+	ReplyTarget      string `json:"reply_target" form:"reply_target"`
+	AllowReplied     int32  `json:"allow_replied" form:"allow_replied"`
+	MatchKeywords    string `json:"match_keywords" form:"match_keywords"`
+	Enabled          int32  `json:"enabled" form:"enabled"`
+	MaxCount         int32  `json:"max_count" form:"max_count"`
+	ActiveTimeStart  string `json:"active_time_start" form:"active_time_start"`
+	ActiveTimeEnd    string `json:"active_time_end" form:"active_time_end"`
+}
+
+func PluginWeltolkAutoReplyListAdd(c echo.Context) error {
 	uid := c.Get("uid").(string)
-	numUID, _ := strconv.ParseInt(uid, 10, 64)
-
-	pidStr := c.FormValue("pid")
-	fname := c.FormValue("fname")
-	tidStr := c.FormValue("tid")
-	replyContent := c.FormValue("reply_content")
-	replyIntervalStr := c.FormValue("reply_interval")
-	replyProbabilityStr := c.FormValue("reply_probability")
-	triggerMode := c.FormValue("trigger_mode")
-	matchKeywords := c.FormValue("match_keywords")
-	replyTarget := c.FormValue("reply_target")
-	allowRepliedStr := c.FormValue("allow_replied")
-	enabledStr := c.FormValue("enabled")
-
-	// Parse pid - use the pid from frontend directly (BUG3 fix)
-	numPid, err := strconv.ParseInt(pidStr, 10, 64)
-	if err != nil {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 pid", _function.EchoEmptyObject, "tbsign"))
+	binding := new(weltolkAutoReplyListAddBinding)
+	if err := c.Bind(binding); err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
 	}
-
-	// Validate pid belongs to user
-	var accountInfo model.TcBaiduid
-	_function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", numPid, uid).Take(&accountInfo)
-	if accountInfo.Portrait == "" {
-		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "无效 pid", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Parse tid
-	numTid, err := strconv.ParseInt(tidStr, 10, 64)
-	if err != nil || numTid == 0 {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 tid", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	if fname == "" || replyContent == "" {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Parse optional fields
-	replyInterval := 300
-	if v, err := strconv.Atoi(replyIntervalStr); err == nil && v > 0 {
-		replyInterval = v
-	}
-	replyProbability := 100
-	if v, err := strconv.Atoi(replyProbabilityStr); err == nil && v > 0 && v <= 100 {
-		replyProbability = v
-	}
-	if triggerMode == "" {
-		triggerMode = "new_floor"
-	}
-	if replyTarget == "" {
-		replyTarget = "floor"
-	}
-	allowReplied := int8(0)
-	if allowRepliedStr == "1" {
-		allowReplied = 1
-	}
-	enabled := int8(1)
-	if enabledStr == "0" {
-		enabled = 0
-	}
-
-	// Check limit
-	personalLimit := 0
-	personalLimitStr := _function.GetUserOption("weltolk_autoreply_limit", uid)
-	if personalLimitStr != "" {
-		if v, err := strconv.Atoi(personalLimitStr); err == nil && v > 0 {
-			personalLimit = v
-		}
-	}
-	globalLimit, _ := strconv.Atoi(_function.GetOption("weltolk_autoreply_limit"))
-	limit := globalLimit
-	if personalLimit > 0 {
-		limit = personalLimit
-	}
-	if limit <= 0 {
-		limit = 5
-	}
+	numUID, _ := strconv.Atoi(uid)
 
 	var count int64
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", uid).Count(&count)
-	if int(count) >= limit {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, fmt.Sprintf("已达到最大任务数限制（%d 条）", limit), _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Create task
-	newTask := &model.TcWeltolkAutoreplyTasks{
-		UID:              int(numUID),
-		Pid:              int(numPid),
-		Fname:            fname,
-		Tid:              numTid,
-		ReplyContent:     replyContent,
-		ReplyInterval:    replyInterval,
-		ReplyProbability: replyProbability,
-		Enabled:          enabled,
-		TriggerMode:      triggerMode,
-		ReplyTarget:      replyTarget,
-		AllowReplied:     allowReplied,
-		MatchKeywords:    matchKeywords,
-	}
-
-	err = _function.GormDB.W.Create(newTask).Error
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "创建任务失败", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", newTask, "tbsign"))
-}
-
-// list PUT /:id - Edit task
-func PluginWeltolkAutoreplyEditTask(c echo.Context) error {
-	uid := c.Get("uid").(string)
-	id := c.Param("id")
-
-	numID, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无效 id", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Check ownership
-	var existingTask model.TcWeltolkAutoreplyTasks
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", numID, uid).Take(&existingTask)
-	if existingTask.ID == 0 {
-		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Parse fields
-	pidStr := c.FormValue("pid")
-	fname := c.FormValue("fname")
-	tidStr := c.FormValue("tid")
-	replyContent := c.FormValue("reply_content")
-	replyIntervalStr := c.FormValue("reply_interval")
-	replyProbabilityStr := c.FormValue("reply_probability")
-	triggerMode := c.FormValue("trigger_mode")
-	matchKeywords := c.FormValue("match_keywords")
-	replyTarget := c.FormValue("reply_target")
-	allowRepliedStr := c.FormValue("allow_replied")
-	enabledStr := c.FormValue("enabled")
-
-	updates := map[string]any{}
-
-	if pidStr != "" {
-		numPid, err := strconv.ParseInt(pidStr, 10, 64)
-		if err == nil {
-			// Validate pid belongs to user
-			var accountInfo model.TcBaiduid
-			_function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", numPid, uid).Take(&accountInfo)
-			if accountInfo.Portrait != "" {
-				updates["pid"] = int(numPid)
-			}
-		}
-	}
-
-	if fname != "" {
-		updates["fname"] = fname
-	}
-	if tidStr != "" {
-		numTid, err := strconv.ParseInt(tidStr, 10, 64)
-		if err == nil {
-			updates["tid"] = numTid
-		}
-	}
-	if replyContent != "" {
-		updates["reply_content"] = replyContent
-	}
-	if replyIntervalStr != "" {
-		if v, err := strconv.Atoi(replyIntervalStr); err == nil && v > 0 {
-			updates["reply_interval"] = v
-		}
-	}
-	if replyProbabilityStr != "" {
-		if v, err := strconv.Atoi(replyProbabilityStr); err == nil && v > 0 && v <= 100 {
-			updates["reply_probability"] = v
-		}
-	}
-	if triggerMode != "" {
-		updates["trigger_mode"] = triggerMode
-	}
-	if matchKeywords != "" || triggerMode == "keyword" {
-		updates["match_keywords"] = matchKeywords
-	}
-	if replyTarget != "" {
-		updates["reply_target"] = replyTarget
-	}
-	if allowRepliedStr != "" {
-		updates["allow_replied"] = int8(0)
-		if allowRepliedStr == "1" {
-			updates["allow_replied"] = int8(1)
-		}
-	}
-	if enabledStr != "" {
-		updates["enabled"] = int8(0)
-		if enabledStr == "1" {
-			updates["enabled"] = int8(1)
-		}
-	}
-
-	if len(updates) > 0 {
-		_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", numID, uid).Updates(updates)
-	}
-
-	// Return updated task
-	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", numID).Take(&existingTask)
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", existingTask, "tbsign"))
-}
-
-// list DELETE /:id
-func PluginWeltolkAutoreplyDelTask(c echo.Context) error {
-	uid := c.Get("uid").(string)
-	id := c.Param("id")
-
-	numUID, _ := strconv.ParseInt(uid, 10, 64)
-	numID, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无效 id", map[string]any{
-			"success": false,
-			"id":      id,
-		}, "tbsign"))
-	}
-
-	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", numID, numUID).Delete(&model.TcWeltolkAutoreplyTasks{})
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
-		"success": true,
-		"id":      id,
-	}, "tbsign"))
-}
-
-// list /empty POST
-func PluginWeltolkAutoreplyDelAllTasks(c echo.Context) error {
-	uid := c.Get("uid").(string)
-	numUID, _ := strconv.ParseInt(uid, 10, 64)
-
-	_function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", numUID).Delete(&model.TcWeltolkAutoreplyTasks{})
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", true, "tbsign"))
-}
-
-// test POST
-func PluginWeltolkAutoreplyTest(c echo.Context) error {
-	uid := c.Get("uid").(string)
-
-	fname := c.FormValue("fname")
-	tidStr := c.FormValue("tid")
-	replyContent := c.FormValue("reply_content")
-	pidStr := c.FormValue("pid")
-	triggerMode := c.FormValue("trigger_mode")
-	matchKeywords := c.FormValue("match_keywords")
-	replyTarget := c.FormValue("reply_target")
-
-	numPid, err := strconv.ParseInt(pidStr, 10, 64)
-	if err != nil {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 pid", _function.EchoEmptyObject, "tbsign"))
-	}
-
-	// Validate pid belongs to user
-	var accountInfo model.TcBaiduid
-	_function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", numPid, uid).Take(&accountInfo)
-	if accountInfo.Portrait == "" {
+	if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", binding.Pid, numUID).Count(&count).Error; err != nil || count == 0 {
 		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "越权操作：该百度账号不属于您", _function.EchoEmptyObject, "tbsign"))
 	}
 
-	numTid, err := strconv.ParseInt(tidStr, 10, 64)
-	if err != nil || numTid == 0 {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "请填写帖子ID", _function.EchoEmptyObject, "tbsign"))
-	}
-	if fname == "" || replyContent == "" {
-		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || (strings.TrimSpace(binding.ReplyContent) == "" && strings.TrimSpace(binding.ReplyContentList) == "") {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
 	}
 
-	cookie := _function.GetCookie(int32(numPid))
-	if !cookie.IsLogin || cookie.Bduss == "" {
-		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法获取BDUSS", _function.EchoEmptyObject, "tbsign"))
+	limit := weltolkAutoreplyGetUserLimit(uid)
+	var userCount int64
+	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("uid = ?", numUID).Count(&userCount)
+	if int(userCount) >= limit {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, fmt.Sprintf("已达到最大任务数限制（%d 条）", limit), _function.EchoEmptyObject, "tbsign"))
 	}
 
-	tbs := cookie.Tbs
-	fid := _function.GetFid(fname)
+	if binding.ReplyInterval <= 0 {
+		binding.ReplyInterval = 300
+	}
+	if binding.ReplyIntervalMin <= 0 {
+		binding.ReplyIntervalMin = binding.ReplyInterval // fallback
+		if binding.ReplyIntervalMin <= 0 {
+			binding.ReplyIntervalMin = 300
+		}
+	}
+	if binding.ReplyIntervalMax < binding.ReplyIntervalMin {
+		binding.ReplyIntervalMax = 0
+	}
+	if binding.ReplyProbability <= 0 || binding.ReplyProbability > 100 {
+		binding.ReplyProbability = 100
+	}
+	if binding.TriggerMode == "" {
+		binding.TriggerMode = "new_floor"
+	}
+	if binding.ReplyTarget == "" {
+		binding.ReplyTarget = "floor"
+	}
+	if binding.Enabled != 0 && binding.Enabled != 1 {
+		binding.Enabled = 1
+	}
 
-	// Get floor info
+	task := &model.TcWeltolkAutoreplyTasks{
+		UID:              int32(numUID),
+		Pid:              binding.Pid,
+		Fname:            strings.TrimSpace(binding.Fname),
+		Tid:              binding.Tid,
+		ReplyContent:     binding.ReplyContent,
+		ReplyContentList: binding.ReplyContentList,
+		ReplyInterval:    binding.ReplyIntervalMin,
+		ReplyIntervalMin: binding.ReplyIntervalMin,
+		ReplyIntervalMax: binding.ReplyIntervalMax,
+		ReplyProbability: binding.ReplyProbability,
+		Enabled:          binding.Enabled,
+		TriggerMode:      binding.TriggerMode,
+		ReplyTarget:      binding.ReplyTarget,
+		AllowReplied:     binding.AllowReplied,
+		MatchKeywords:    binding.MatchKeywords,
+		MaxCount:         binding.MaxCount,
+		ActiveTimeStart:  binding.ActiveTimeStart,
+		ActiveTimeEnd:    binding.ActiveTimeEnd,
+	}
+	if err := _function.GormDB.W.Create(task).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.list.add", "uid", uid, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListEdit(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// Verify task exists and belongs to user
+	var existingTask model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Take(&existingTask).Error; err != nil {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	binding := new(weltolkAutoReplyListAddBinding)
+	if err := c.Bind(binding); err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+	numUID, _ := strconv.Atoi(uid)
+
+	// Validate pid if provided
+	if binding.Pid > 0 {
+		var count int64
+		if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", binding.Pid, numUID).Count(&count).Error; err != nil || count == 0 {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "越权操作：该百度账号不属于您", _function.EchoEmptyObject, "tbsign"))
+		}
+	}
+
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || (strings.TrimSpace(binding.ReplyContent) == "" && strings.TrimSpace(binding.ReplyContentList) == "") {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "请填写所有必填字段", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if binding.ReplyInterval <= 0 {
+		binding.ReplyInterval = 300
+	}
+	if binding.ReplyIntervalMin <= 0 {
+		binding.ReplyIntervalMin = binding.ReplyInterval // fallback
+		if binding.ReplyIntervalMin <= 0 {
+			binding.ReplyIntervalMin = 300
+		}
+	}
+	if binding.ReplyIntervalMax < binding.ReplyIntervalMin {
+		binding.ReplyIntervalMax = 0
+	}
+	if binding.ReplyProbability <= 0 || binding.ReplyProbability > 100 {
+		binding.ReplyProbability = 100
+	}
+	if binding.TriggerMode == "" {
+		binding.TriggerMode = "new_floor"
+	}
+	if binding.ReplyTarget == "" {
+		binding.ReplyTarget = "floor"
+	}
+	if binding.Enabled != 0 && binding.Enabled != 1 {
+		binding.Enabled = 1
+	}
+
+	updates := map[string]any{
+		"fname":               strings.TrimSpace(binding.Fname),
+		"tid":                 binding.Tid,
+		"reply_content":       binding.ReplyContent,
+		"reply_content_list":  binding.ReplyContentList,
+		"reply_interval":      binding.ReplyIntervalMin,
+		"reply_interval_min":  binding.ReplyIntervalMin,
+		"reply_interval_max":  binding.ReplyIntervalMax,
+		"reply_probability":   binding.ReplyProbability,
+		"trigger_mode":        binding.TriggerMode,
+		"reply_target":        binding.ReplyTarget,
+		"allow_replied":       binding.AllowReplied,
+		"match_keywords":      binding.MatchKeywords,
+		"enabled":             binding.Enabled,
+		"max_count":           binding.MaxCount,
+		"active_time_start":   binding.ActiveTimeStart,
+		"active_time_end":     binding.ActiveTimeEnd,
+	}
+	if binding.Pid > 0 {
+		updates["pid"] = binding.Pid
+	}
+
+	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(updates).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.list.edit", "uid", uid, "id", id, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// Read updated task
+	var updatedTask model.TcWeltolkAutoreplyTasks
+	_function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ?", id).Take(&updatedTask)
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", updatedTask, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListDelete(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	var task model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Take(&task).Error; err != nil {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if err := _function.GormDB.W.Where("id = ? AND uid = ?", id, uid).Delete(&model.TcWeltolkAutoreplyTasks{}).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.list.delete", "uid", uid, "id", id, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "删除失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListToggle(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	var task model.TcWeltolkAutoreplyTasks
+	if err := _function.GormDB.R.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Take(&task).Error; err != nil {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "任务不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	newEnabled := int32(1)
+	if task.Enabled == 1 {
+		newEnabled = 0
+	}
+
+	if err := _function.GormDB.W.Model(&model.TcWeltolkAutoreplyTasks{}).Where("id = ? AND uid = ?", id, uid).Updates(map[string]any{
+		"enabled": newEnabled,
+	}).Error; err != nil {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "切换失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
+	}
+
+	task.Enabled = newEnabled
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", task, "tbsign"))
+}
+
+func PluginWeltolkAutoReplyListEmpty(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	if err := _function.GormDB.W.Where("uid = ?", uid).Delete(&model.TcWeltolkAutoreplyTasks{}).Error; err != nil {
+		slog.Error("plugin.weltolk-autoreply.list.empty", "uid", uid, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "删除失败："+err.Error(), _function.EchoEmptyObject, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", _function.EchoEmptyObject, "tbsign"))
+}
+
+type weltolkAutoReplyTestBinding struct {
+	Pid           int32  `json:"pid" form:"pid"`
+	Fname         string `json:"fname" form:"fname"`
+	Tid           int64  `json:"tid" form:"tid"`
+	ReplyContent  string `json:"reply_content" form:"reply_content"`
+	TriggerMode   string `json:"trigger_mode" form:"trigger_mode"`
+	ReplyTarget   string `json:"reply_target" form:"reply_target"`
+	AllowReplied  int32  `json:"allow_replied" form:"allow_replied"`
+	MatchKeywords string `json:"match_keywords" form:"match_keywords"`
+}
+
+func PluginWeltolkAutoReplyTest(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	binding := new(weltolkAutoReplyTestBinding)
+	if err := c.Bind(binding); err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+	numUID, _ := strconv.Atoi(uid)
+
+	var count int64
+	if err := _function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", binding.Pid, numUID).Count(&count).Error; err != nil || count == 0 {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "越权操作：该百度账号不属于您", _function.EchoEmptyObject, "tbsign"))
+	}
+	if strings.TrimSpace(binding.Fname) == "" || binding.Tid == 0 || strings.TrimSpace(binding.ReplyContent) == "" {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "测试发帖失败：请填写贴吧名称、帖子ID、回帖内容，并选择发帖账号", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	cookie := _function.GetCookie(binding.Pid, true)
+	if cookie == nil || cookie.Bduss == "" {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "测试发帖失败：无法获取所选账号的 BDUSS", _function.EchoEmptyObject, "tbsign"))
+	}
+	bduss := cookie.Bduss
+	stoken := cookie.Stoken
+
+	tbsResp, err := _function.GetTbs(bduss)
+	if err != nil || tbsResp == nil || tbsResp.Tbs == "" {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "测试发帖失败：获取 TBS 失败", _function.EchoEmptyObject, "tbsign"))
+	}
+	tbs := tbsResp.Tbs
+
+	fid := _function.GetFid(binding.Fname)
+	if fid == 0 {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "测试发帖失败：获取 fid 失败", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	triggerMode := binding.TriggerMode
+	if triggerMode == "" {
+		triggerMode = "new_floor"
+	}
+	replyTarget := binding.ReplyTarget
+	if replyTarget == "" {
+		replyTarget = "floor"
+	}
+
 	quoteID := ""
 	replyUID := ""
 	floorNum := ""
 	subPostID := ""
 	atUsername := ""
 	atPortrait := ""
-	testInfo := ""
-	skipTest := false
+
+	// 获取帖子总数以计算最后一页（获取最新楼层）
+	_, totalPage, replyOk := weltolkGetReplyCount(binding.Tid, bduss)
+	if !replyOk {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "测试发帖失败：获取帖子信息失败", _function.EchoEmptyObject, "tbsign"))
+	}
 
 	if triggerMode == "keyword" {
-		if strings.TrimSpace(matchKeywords) == "" {
-			// No keywords set, will post as topic reply
-		} else {
-			floors, err := weltolkGetLastFloorContent(numTid, cookie.Bduss, 20)
-			if err != nil || len(floors) == 0 {
-				return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "获取楼层内容失败，无法测试关键词匹配", _function.EchoEmptyObject, "tbsign"))
+		if strings.TrimSpace(binding.MatchKeywords) == "" {
+			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词模式但未设置关键词，将作为主题回复", _function.EchoEmptyObject, "tbsign"))
+		}
+		floors := weltolkGetLastFloorContent(binding.Tid, bduss, 20, totalPage)
+		if len(floors) == 0 {
+			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "获取楼层内容失败，无法测试关键词匹配", _function.EchoEmptyObject, "tbsign"))
+		}
+		matched := false
+		keywords := strings.Split(binding.MatchKeywords, "\n")
+		for _, floor := range floors {
+			if strings.TrimSpace(floor.Content) == "" {
+				continue
 			}
-
-			keywords := strings.Split(matchKeywords, "\n")
-			matched := false
-			for _, floor := range floors {
-				floorContent := floor.Content
-				if floorContent == "" {
+			for _, kw := range keywords {
+				kw = strings.TrimSpace(kw)
+				if kw == "" {
 					continue
 				}
-				for _, kw := range keywords {
-					kw = strings.TrimSpace(kw)
-					if kw == "" {
-						continue
-					}
-					if strings.Contains(strings.ToLower(floorContent), strings.ToLower(kw)) {
-						matched = true
-						quoteID = toString(floor.ID)
-						floorNum = toString(floor.Floor)
-						atUsername = floor.Username
-						atPortrait = floor.Portrait
-						replyUID = toString(floor.AuthorID)
-
-						// Subpost mode
-						if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
-							subMatched := false
-							for _, sp := range floor.SubPosts {
-								spContent := sp.Content
-								if spContent != "" && strings.Contains(strings.ToLower(spContent), strings.ToLower(kw)) {
-									subPostID = toString(sp.ID)
-									replyUID = toString(sp.AuthorID)
-									atUsername = sp.Username
-									atPortrait = sp.Portrait
-									subMatched = true
-									break
-								}
+				if strings.Contains(strings.ToLower(floor.Content), strings.ToLower(kw)) {
+					matched = true
+					quoteID = strconv.FormatInt(floor.ID, 10)
+					floorNum = strconv.FormatInt(floor.Floor, 10)
+					atUsername = floor.Username
+					atPortrait = floor.Portrait
+					replyUID = strconv.FormatInt(floor.AuthorID, 10)
+					if replyTarget == "subpost" && len(floor.SubPosts) > 0 {
+						for _, sp := range floor.SubPosts {
+							if strings.TrimSpace(sp.Content) == "" {
+								continue
 							}
-							if !subMatched {
-								subPostID = ""
-								atUsername = floor.Username
-								atPortrait = floor.Portrait
-								replyUID = toString(floor.AuthorID)
+							if strings.Contains(strings.ToLower(sp.Content), strings.ToLower(kw)) {
+								subPostID = strconv.FormatInt(sp.ID, 10)
+								replyUID = strconv.FormatInt(sp.AuthorID, 10)
+								atUsername = sp.Username
+								atPortrait = sp.Portrait
+								break
 							}
 						}
-						break
 					}
-				}
-				if matched {
-					break
+					goto testMatched
 				}
 			}
-			if !matched {
-				return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词未匹配任何楼层", map[string]any{
-					"matched": false,
-					"info":    "最新 " + strconv.Itoa(len(floors)) + " 个楼层中未找到任何匹配关键词的内容",
-				}, "tbsign"))
-			}
-			testInfo = fmt.Sprintf("（关键词匹配 @#%s %s）", floorNum, atUsername)
+		}
+	testMatched:
+		if !matched {
+			return c.JSON(http.StatusOK, _function.ApiTemplate(200, "关键词未匹配任何楼层", _function.EchoEmptyObject, "tbsign"))
 		}
 	} else {
-		// new_floor mode
-		latestFloors, err := weltolkGetLastFloorContent(numTid, cookie.Bduss, 1)
-		if err == nil && len(latestFloors) > 0 {
+		latestFloors := weltolkGetLastFloorContent(binding.Tid, bduss, 1, totalPage)
+		if len(latestFloors) > 0 {
 			latest := latestFloors[0]
-			quoteID = toString(latest.ID)
-			replyUID = toString(latest.AuthorID)
-			floorNum = toString(latest.Floor)
+			quoteID = strconv.FormatInt(latest.ID, 10)
+			replyUID = strconv.FormatInt(latest.AuthorID, 10)
+			floorNum = strconv.FormatInt(latest.Floor, 10)
 			atUsername = latest.Username
 			atPortrait = latest.Portrait
-			testInfo = fmt.Sprintf("（回复 @#%s %s）", floorNum, atUsername)
 		}
 	}
 
-	// Variable replacement
 	floorForReplace := floorNum
 	if floorForReplace == "" {
 		floorForReplace = "测试"
 	}
-	content := replyContent
-	content = strings.ReplaceAll(content, "{floor}", floorForReplace)
-	content = strings.ReplaceAll(content, "{time}", time.Now().Format("2006-01-02 15:04:05"))
-	content = strings.ReplaceAll(content, "{date}", time.Now().Format("2006-01-02"))
-	content = strings.ReplaceAll(content, "{tid}", strconv.FormatInt(numTid, 10))
-	content = strings.ReplaceAll(content, "{username}", atUsername)
+	now := time.Now().Unix()
+	content := strings.NewReplacer(
+		"{floor}", floorForReplace,
+		"{time}", time.Unix(now, 0).Format("2006-01-02 15:04:05"),
+		"{date}", time.Unix(now, 0).Format("2006-01-02"),
+		"{tid}", strconv.FormatInt(binding.Tid, 10),
+		"{username}", atUsername,
+	).Replace(binding.ReplyContent)
 
-	// Subpost prefix
 	if triggerMode == "keyword" && replyTarget == "subpost" && subPostID != "" && atUsername != "" {
-		content = "回复 #(reply, " + atPortrait + ", " + atUsername + ") :" + content
+		content = fmt.Sprintf("回复 #(reply, %s, %s) :%s", atPortrait, atUsername, content)
 	}
 
-	if skipTest {
-		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "跳过测试", map[string]any{
-			"skipped": true,
-		}, "tbsign"))
-	}
-
-	result := autoreplyAddPost(cookie.Bduss, cookie.Stoken, tbs, fname, fid, numTid, content, "贴吧用户", quoteID, replyUID, floorNum, subPostID)
-
-	type testResult struct {
-		Success   bool   `json:"success"`
-		ErrorCode int    `json:"error_code"`
-		ErrorMsg  string `json:"error_msg"`
-		NeedVcode bool   `json:"need_vcode"`
-		Info      string `json:"info,omitempty"`
-		RawDebug  string `json:"raw_debug,omitempty"`
-	}
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", testResult{
-		Success:   result.Success,
-		ErrorCode: result.ErrorCode,
-		ErrorMsg:  result.ErrorMsg,
-		NeedVcode: result.NeedVcode,
-		Info:      testInfo,
-		RawDebug:  result.RawDebug,
-	}, "tbsign"))
+	result := autoreplyAddPost(bduss, stoken, tbs, binding.Fname, fid, binding.Tid, content, "贴吧用户", quoteID, replyUID, floorNum, subPostID)
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", result, "tbsign"))
 }
 
-// settings GET
-func PluginWeltolkAutoreplyGetSettings(c echo.Context) error {
+func PluginWeltolkAutoReplySettings(c echo.Context) error {
 	uid := c.Get("uid").(string)
-
-	globalLimit, _ := strconv.Atoi(_function.GetOption("weltolk_autoreply_limit"))
-	personalLimit := 0
-	personalLimitStr := _function.GetUserOption("weltolk_autoreply_limit", uid)
-	if personalLimitStr != "" {
-		if v, err := strconv.Atoi(personalLimitStr); err == nil && v > 0 {
-			personalLimit = v
-		}
+	global := _function.GetOption(weltolkAutoreplyLimitKey)
+	if global == "" {
+		global = "5"
 	}
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
-		"global_limit":   globalLimit,
-		"personal_limit": personalLimit,
+	personal := _function.GetUserOption(weltolkAutoreplyLimitKey, uid)
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
+		"global_limit":   global,
+		"personal_limit": personal,
 	}, "tbsign"))
 }
 
-// settings PUT
-func PluginWeltolkAutoreplySetSettings(c echo.Context) error {
+type weltolkAutoReplySettingsUpdateBinding struct {
+	GlobalLimit   *int `json:"global_limit" form:"global_limit"`
+	PersonalLimit *int `json:"personal_limit" form:"personal_limit"`
+}
+
+func PluginWeltolkAutoReplySettingsUpdate(c echo.Context) error {
 	uid := c.Get("uid").(string)
-	personalLimitStr := c.FormValue("personal_limit")
+	role, _ := c.Get("role").(string)
+	isAdmin := role == _function.RoleAdmin
 
-	personalLimit := 0
-	if personalLimitStr != "" {
-		v, err := strconv.Atoi(personalLimitStr)
-		if err != nil || v < 0 {
-			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效的限制值", _function.EchoEmptyObject, "tbsign"))
+	binding := new(weltolkAutoReplySettingsUpdateBinding)
+	if err := c.Bind(binding); err != nil {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "error", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if binding.GlobalLimit != nil {
+		if !isAdmin {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无权修改全局限额", _function.EchoEmptyObject, "tbsign"))
 		}
-		personalLimit = v
-	}
-
-	if personalLimit == 0 {
-		// Clear personal override, use global default
-		_function.DeleteUserOption("weltolk_autoreply_limit", uid)
-	} else {
-		err := _function.SetUserOption("weltolk_autoreply_limit", personalLimit, uid)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法更新设置", _function.EchoEmptyObject, "tbsign"))
+		if *binding.GlobalLimit < 1 {
+			*binding.GlobalLimit = 1
+		}
+		if err := _function.SetOption(weltolkAutoreplyLimitKey, *binding.GlobalLimit); err != nil {
+			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
 		}
 	}
 
-	globalLimit, _ := strconv.Atoi(_function.GetOption("weltolk_autoreply_limit"))
-
-	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
-		"global_limit":   globalLimit,
-		"personal_limit": personalLimit,
-	}, "tbsign"))
-}
-
-// ============================================================
-// Helper functions
-// ============================================================
-
-func toInt64(v any) int64 {
-	switch val := v.(type) {
-	case float64:
-		return int64(val)
-	case string:
-		n, err := strconv.ParseInt(val, 10, 64)
-		if err != nil {
-			return 0
+	if binding.PersonalLimit != nil {
+		if *binding.PersonalLimit < 0 {
+			*binding.PersonalLimit = 0
 		}
-		return n
-	case int:
-		return int64(val)
-	case int64:
-		return val
-	default:
-		return 0
-	}
-}
-
-func toString(v any) string {
-	if v == nil {
-		return ""
-	}
-	switch val := v.(type) {
-	case string:
-		return val
-	case float64:
-		if val == float64(int64(val)) {
-			return strconv.FormatInt(int64(val), 10)
+		if err := _function.SetUserOption(weltolkAutoreplyLimitKey, *binding.PersonalLimit, uid); err != nil {
+			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "保存失败", _function.EchoEmptyObject, "tbsign"))
 		}
-		return strconv.FormatFloat(val, 'f', -1, 64)
-	case int:
-		return strconv.Itoa(val)
-	case int64:
-		return strconv.FormatInt(val, 10)
-	default:
-		return fmt.Sprintf("%v", v)
 	}
-}
 
-func toInt64FromStr(s string) int64 {
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
+	return PluginWeltolkAutoReplySettings(c)
 }

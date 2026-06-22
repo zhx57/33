@@ -10,7 +10,7 @@ const tasksSwitch = ref<boolean>(false)
 const limit = ref<number>(0)
 const loadingList = ref<boolean>(false)
 
-const settings = ref<{ global_limit: string; personal_limit: string; global_cooldown: string }>({ global_limit: '5', personal_limit: '', global_cooldown: '0' })
+const settings = ref<{ global_limit: string; personal_limit: string }>({ global_limit: '5', personal_limit: '' })
 
 const tasksList = ref<
     {
@@ -121,9 +121,7 @@ const helpTexts: Record<string, string> = {
     reply_content_list: '回复内容（随机发送）\n每行写一条回复内容，系统会随机选择一条发送。\n写多条可以避免每次回复都一样，更自然。\n举例：\n打卡打卡\n今天也来签到了\n继续坚持',
     reply_interval_range: '回复间隔范围\n设置两次回复之间的等待时间范围。\n最小间隔和最大间隔可以不同，系统会在范围内随机取值。\n举例：最小60秒、最大300秒，意味着每次回复后等1-5分钟不等。\n如果最小和最大一样，就是固定间隔。',
     max_count: '最大执行次数\n设置这个任务最多回复几次，0表示无限次。\n举例：填10，就是回复10次后自动停止。\n适合只想回复固定次数的场景。',
-    active_time: '活跃时间窗口\n设置每天允许自动回复的时间段。\n举例：08:00-22:00，就只在早8点到晚10点之间回复。\n留空表示全天24小时都可以回复。\n支持跨午夜，如 22:00-08:00。',
-    global_cooldown:
-        '全局回复冷却时间（秒）\n设置任意两次回复之间的最小间隔，跨所有任务生效。\n举例：填300，就是任何任务回复后，所有任务至少等5分钟才能再回复。\n0表示不启用全局冷却，每个任务按自己的间隔独立运行。\n适合多任务场景，避免短时间内多个任务连续回复。'
+    active_time: '活跃时间窗口\n设置每天允许自动回复的时间段。\n举例：08:00-22:00，就只在早8点到晚10点之间回复。\n留空表示全天24小时都可以回复。\n支持跨午夜，如 22:00-08:00。'
 }
 
 const showHelp = (key: string) => {
@@ -410,9 +408,6 @@ const saveSettings = () => {
     if (settings.value.personal_limit !== '') {
         params.personal_limit = settings.value.personal_limit
     }
-    if (settings.value.global_cooldown !== '') {
-        params.global_cooldown = settings.value.global_cooldown
-    }
     Request(store.basePath + '/plugins/weltolk_autoreply/settings', {
         headers: {
             Authorization: store.authorization,
@@ -429,7 +424,6 @@ const saveSettings = () => {
         if (res.data) {
             settings.value.global_limit = res.data.global_limit || '5'
             settings.value.personal_limit = res.data.personal_limit || ''
-            settings.value.global_cooldown = res.data.global_cooldown || '0'
         }
     })
 }
@@ -557,15 +551,6 @@ onMounted(() => {
                     <label>个人限额（0 表示使用全局）</label>
                     <input type="number" v-model="settings.personal_limit" class="bg-gray-100 dark:bg-gray-900 dark:text-gray-100 form-input w-full rounded-xl mt-1" min="0" />
                 </div>
-            </div>
-        </div>
-
-        <div class="my-5">
-            <h4 class="my-2 text-xl">全局回复冷却 <button @click="showHelp('global_cooldown')" class="inline-block text-xs bg-sky-500 text-white rounded px-1">?</button></h4>
-            <div class="max-w-[48em]">
-                <label>冷却时间（秒，0=不启用）</label>
-                <input type="number" v-model="settings.global_cooldown" class="bg-gray-100 dark:bg-gray-900 dark:text-gray-100 form-input w-full rounded-xl mt-1" min="0" placeholder="0" />
-                <p class="text-xs text-gray-500 mt-1">设置后，任意任务回复成功后，所有任务至少等待此时间才能再次回复。适合多任务场景，避免短时间连续回复。</p>
             </div>
         </div>
 
