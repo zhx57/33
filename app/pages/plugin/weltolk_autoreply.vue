@@ -122,7 +122,8 @@ const helpTexts: Record<string, string> = {
     reply_interval_range: '回复间隔范围\n设置两次回复之间的等待时间范围。\n最小间隔和最大间隔可以不同，系统会在范围内随机取值。\n举例：最小60秒、最大300秒，意味着每次回复后等1-5分钟不等。\n如果最小和最大一样，就是固定间隔。',
     max_count: '最大执行次数\n设置这个任务最多回复几次，0表示无限次。\n举例：填10，就是回复10次后自动停止。\n适合只想回复固定次数的场景。',
     active_time: '活跃时间窗口\n设置每天允许自动回复的时间段。\n举例：08:00-22:00，就只在早8点到晚10点之间回复。\n留空表示全天24小时都可以回复。\n支持跨午夜，如 22:00-08:00。',
-    global_cooldown: '全局回复冷却时间（秒）\n设置任意两次回复之间的最小间隔，跨所有任务生效。\n举例：填300，就是任何任务回复后，所有任务至少等5分钟才能再回复。\n0表示不启用全局冷却，每个任务按自己的间隔独立运行。\n适合多任务场景，避免短时间内多个任务连续回复。'
+    global_cooldown:
+        '全局回复冷却时间（秒）\n设置任意两次回复之间的最小间隔，跨所有任务生效。\n举例：填300，就是任何任务回复后，所有任务至少等5分钟才能再回复。\n0表示不启用全局冷却，每个任务按自己的间隔独立运行。\n适合多任务场景，避免短时间内多个任务连续回复。'
 }
 
 const showHelp = (key: string) => {
@@ -208,7 +209,7 @@ const addTask = (enabledOverride?: number) => {
         Notice('请选择百度账号', 'error')
         return
     }
-    const enabled = enabledOverride !== undefined ? enabledOverride : (taskToAdd.value.enabled ? 1 : 0)
+    const enabled = enabledOverride !== undefined ? enabledOverride : taskToAdd.value.enabled ? 1 : 0
     Request(store.basePath + '/plugins/weltolk_autoreply/list', {
         headers: {
             Authorization: store.authorization,
@@ -490,6 +491,9 @@ const statusText = (status: string) => {
 }
 
 const taskStatusDisplay = (task: (typeof tasksList.value)[0]) => {
+    if (!task.last_status && task.last_check_time === 0) {
+        return { text: '尚未执行', class: 'text-gray-500' }
+    }
     if (task.enabled === 1) {
         if (task.last_status === 'error') {
             return { text: '异常', class: 'text-yellow-500' }
@@ -702,10 +706,15 @@ onMounted(() => {
                         <span class="font-bold">{{ task.fname }}吧 </span><NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/p/' + task.tid" target="blank">帖子{{ task.tid }}</NuxtLink>
                     </li>
                     <li>
-                        <span class="font-bold">回复内容预览 : </span><span class="text-sm">{{ (task.reply_content_list || task.reply_content || '').split('\n')[0] }}{{ (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length > 1 ? '（随机' + (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length + '条）' : '' }}</span>
+                        <span class="font-bold">回复内容预览 : </span
+                        ><span class="text-sm"
+                            >{{ (task.reply_content_list || task.reply_content || '').split('\n')[0]
+                            }}{{ (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length > 1 ? '（随机' + (task.reply_content_list || '').split('\n').filter((l: string) => l.trim()).length + '条）' : '' }}</span
+                        >
                     </li>
                     <li>
-                        <span class="font-bold">间隔范围 : </span><span class="font-mono">{{ task.reply_interval_min === task.reply_interval_max || !task.reply_interval_max ? task.reply_interval_min + '秒' : task.reply_interval_min + '-' + task.reply_interval_max + '秒' }}</span>
+                        <span class="font-bold">间隔范围 : </span
+                        ><span class="font-mono">{{ task.reply_interval_min === task.reply_interval_max || !task.reply_interval_max ? task.reply_interval_min + '秒' : task.reply_interval_min + '-' + task.reply_interval_max + '秒' }}</span>
                         <span class="ml-3 font-bold">概率 : </span><span class="font-mono">{{ task.reply_probability }}%</span>
                     </li>
                     <li>
@@ -717,12 +726,23 @@ onMounted(() => {
                     <li>
                         <span class="font-bold">状态 : </span>
                         <span :class="taskStatusDisplay(task).class">{{ taskStatusDisplay(task).text }}</span>
+                        <span v-if="task.last_check_time > 0" class="ml-2 text-sm text-gray-500 dark:text-gray-400">· {{ getPubDate(new Date(task.last_check_time * 1000)) }}</span>
+                    </li>
+                    <li v-if="task.last_error">
+                        <span class="font-bold">跳过原因 : </span>
+                        <span class="text-sm text-gray-500 dark:text-gray-400 truncate block" :title="task.last_error">{{ task.last_error }}</span>
                     </li>
                 </ul>
 
                 <hr class="border-gray-400 dark:border-gray-600 my-3" />
 
-                <button :class="task.enabled === 1 ? 'bg-green-500 hover:bg-green-600 dark:hover:bg-green-400' : 'bg-gray-400 hover:bg-gray-500 dark:bg-gray-600 dark:hover:bg-gray-500'" class="rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1" @click="toggleTaskEnabled(task)">{{ task.enabled === 1 ? '已启用' : '已暂停' }}</button>
+                <button
+                    :class="task.enabled === 1 ? 'bg-green-500 hover:bg-green-600 dark:hover:bg-green-400' : 'bg-gray-400 hover:bg-gray-500 dark:bg-gray-600 dark:hover:bg-gray-500'"
+                    class="rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1"
+                    @click="toggleTaskEnabled(task)"
+                >
+                    {{ task.enabled === 1 ? '已启用' : '已暂停' }}
+                </button>
                 <button class="bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 rounded-lg px-3 py-1 text-gray-100 transition-colors mr-1" @click="editTask(task)">编辑</button>
                 <Modal class="mr-1 inline-block" :title="'确认删除任务 #' + task.id + ' ？'">
                     <template #default>
@@ -800,7 +820,16 @@ onMounted(() => {
     </div>
 
     <!-- 帮助弹窗 -->
-    <Modal title="帮助" v-show="true" :active="helpModalVisible" @active-callback="(v: boolean) => { if (!v) helpModalVisible = false }">
+    <Modal
+        title="帮助"
+        v-show="true"
+        :active="helpModalVisible"
+        @active-callback="
+            (v: boolean) => {
+                if (!v) helpModalVisible = false
+            }
+        "
+    >
         <template #default></template>
         <template #container>
             <div class="whitespace-pre-line text-sm">{{ helpTexts[helpModalKey] || '暂无帮助信息。' }}</div>
