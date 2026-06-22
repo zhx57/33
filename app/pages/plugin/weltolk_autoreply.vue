@@ -141,7 +141,16 @@ const updateTasksSwitch = () => {
             Notice(res.message, 'error')
             return
         }
-        tasksSwitch.value = res.data
+        // 切换后重新获取真实状态，确保与数据库同步
+        Request(store.basePath + '/plugins/weltolk_autoreply/switch', {
+            headers: {
+                Authorization: store.authorization
+            }
+        }).then((res2) => {
+            if (res2.code === 200) {
+                tasksSwitch.value = res2.data
+            }
+        })
     })
 }
 
