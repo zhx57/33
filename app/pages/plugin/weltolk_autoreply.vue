@@ -7,10 +7,7 @@ const pidNameKV = computed(() => store.pidNameKV)
 const loading = computed(() => store.loading)
 
 const tasksSwitch = ref<boolean>(false)
-const limit = ref<number>(0)
 const loadingList = ref<boolean>(false)
-
-const settings = ref<{ global_limit: string; personal_limit: string }>({ global_limit: '5', personal_limit: '' })
 
 const tasksList = ref<
     {
@@ -166,10 +163,6 @@ const getTasksList = () => {
                 return
             }
             tasksList.value = res.data?.tasks || []
-            limit.value = res.data?.limit || 0
-            if (limit.value < 0) {
-                limit.value = 0
-            }
         })
         .catch((e) => {
             console.error(e)
@@ -403,31 +396,6 @@ const runTest = () => {
     })
 }
 
-const saveSettings = () => {
-    const params: Record<string, string> = {}
-    if (settings.value.personal_limit !== '') {
-        params.personal_limit = settings.value.personal_limit
-    }
-    Request(store.basePath + '/plugins/weltolk_autoreply/settings', {
-        headers: {
-            Authorization: store.authorization,
-            'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        method: 'PUT',
-        body: new URLSearchParams(params).toString()
-    }).then((res) => {
-        if (res.code !== 200) {
-            Notice(res.message, 'error')
-            return
-        }
-        Notice('设置已保存', 'success')
-        if (res.data) {
-            settings.value.global_limit = res.data.global_limit || '5'
-            settings.value.personal_limit = res.data.personal_limit || ''
-        }
-    })
-}
-
 const parseLogs = (log_: string = '') => {
     if (!log_) {
         return []
@@ -518,17 +486,6 @@ onMounted(() => {
         }
         tasksSwitch.value = res.data
     })
-    Request(store.basePath + '/plugins/weltolk_autoreply/settings', {
-        headers: {
-            Authorization: store.authorization
-        }
-    }).then((res) => {
-        if (res.code !== 200) {
-            Notice(res.message, 'error')
-            return
-        }
-        settings.value = res.data
-    })
 })
 </script>
 
@@ -539,30 +496,13 @@ onMounted(() => {
         <button :class="{ 'bg-sky-500': !tasksSwitch, 'bg-pink-500': tasksSwitch, 'rounded-lg': true, 'px-3': true, 'py-1': true, 'text-gray-100': true, 'transition-colors': true }" @click="updateTasksSwitch">
             {{ tasksSwitch ? '已开启自动回帖' : '已停止自动回帖' }}
         </button>
-
-        <div class="my-5">
-            <h4 class="my-2 text-xl">任务数量限额</h4>
-            <div class="flex gap-3 items-center max-w-[48em]">
-                <div class="grow">
-                    <label>全局限额（仅管理员可改）</label>
-                    <input type="number" v-model="settings.global_limit" class="bg-gray-100 dark:bg-gray-900 dark:text-gray-100 form-input w-full rounded-xl mt-1" disabled />
-                </div>
-                <div class="grow">
-                    <label>个人限额（0 表示使用全局）</label>
-                    <input type="number" v-model="settings.personal_limit" class="bg-gray-100 dark:bg-gray-900 dark:text-gray-100 form-input w-full rounded-xl mt-1" min="0" />
-                </div>
-            </div>
-        </div>
-
-        <button class="bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 transition-colors rounded-lg px-3 py-1 text-gray-100" @click="saveSettings">保存设置</button>
     </div>
 
     <div class="px-3 py-2">
-        <h4 class="text-xl">任务列表 ({{ tasksList.length }}/{{ limit }})</h4>
-        <p v-show="tasksList.length >= limit" class="text-sm">注：任务数已达到或超出上限</p>
+        <h4 class="text-xl">任务列表 ({{ tasksList.length }})</h4>
 
         <div class="my-5 grid grid-cols-6 gap-2 max-w-[48em]">
-            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" :title="editMode ? '编辑自动回帖任务' : '添加自动回帖任务'" v-show="tasksList.length < limit || editMode">
+            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" :title="editMode ? '编辑自动回帖任务' : '添加自动回帖任务'">
                 <template #default>
                     <button class="w-full rounded-2xl border-2 border-gray-300 hover:bg-gray-300 px-4 py-1 hover:text-black transition-colors">{{ editMode ? '编辑任务' : '添加任务' }}</button>
                 </template>

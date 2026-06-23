@@ -177,6 +177,25 @@ export default defineNuxtRouteMiddleware(async (to, from) => {
             return navigateTo('/')
         } else if (routeName.startsWith('plugin-')) {
             const pluginNameFE = routeName.replace(/^plugin\-/, '')
+
+            // 导航到插件页面时重新请求最新的插件列表，避免缓存过期导致误判
+            try {
+                const plugins = await Request(
+                    store.basePath + '/plugins',
+                    {
+                        headers: {
+                            Authorization: authorization
+                        }
+                    },
+                    routeName
+                )
+                if (plugins.code === 200) {
+                    store.updateCache('plugin_list', plugins.data)
+                }
+            } catch (e) {
+                console.error(e)
+            }
+
             const plugin = Object.values(store?._cache?.plugin_list || {}).find((plugin) => plugin.plugin_name_fe === pluginNameFE)
 
             if (!plugin?.status) {
