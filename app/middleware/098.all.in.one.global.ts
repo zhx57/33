@@ -179,7 +179,9 @@ export default defineNuxtRouteMiddleware(async (to, from) => {
             const pluginNameFE = routeName.replace(/^plugin\-/, '')
             const plugin = Object.values(store?._cache?.plugin_list || {}).find((plugin) => plugin.plugin_name_fe === pluginNameFE)
 
-            if (!plugin?.status) {
+            // 管理员允许访问任何插件页面（便于管理未启用的插件）
+            // 非管理员仅当插件存在且已启用时才允许访问
+            if (!store.admin && !plugin?.status) {
                 Notice('插件不可用', 'error')
                 return navigateTo('/')
             }
