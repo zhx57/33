@@ -44,6 +44,7 @@ const tasksList = ref<
 
 const editMode = ref<boolean>(false)
 const editingTaskId = ref<number>(0)
+const editModalActive = ref<boolean>(false)
 
 const taskToAdd = ref<{
     pid: number
@@ -193,6 +194,7 @@ const resetForm = () => {
         active_time_start: '',
         active_time_end: ''
     }
+    editModalActive.value = false
 }
 
 const addTask = (enabledOverride?: number) => {
@@ -257,6 +259,7 @@ const editTask = (task: (typeof tasksList.value)[0]) => {
         active_time_start: task.active_time_start || '',
         active_time_end: task.active_time_end || ''
     }
+    editModalActive.value = true
 }
 
 const saveEditTask = () => {
@@ -502,7 +505,7 @@ onMounted(() => {
         <h4 class="text-xl">任务列表 ({{ tasksList.length }})</h4>
 
         <div class="my-5 grid grid-cols-6 gap-2 max-w-[48em]">
-            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" :title="editMode ? '编辑自动回帖任务' : '添加自动回帖任务'">
+            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" :title="editMode ? '编辑自动回帖任务' : '添加自动回帖任务'" :active="editModalActive" @active-callback="(v: boolean) => editModalActive = v">
                 <template #default>
                     <button class="w-full rounded-2xl border-2 border-gray-300 hover:bg-gray-300 px-4 py-1 hover:text-black transition-colors">{{ editMode ? '编辑任务' : '添加任务' }}</button>
                 </template>
