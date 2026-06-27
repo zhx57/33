@@ -1,0 +1,39 @@
+# Tasks
+- [x] Task 1: 新增 protobuf 编解码辅助函数
+  - [x] SubTask 1.1: 新增 `pbpEncodeVarint/Tag/String/Int32/Int64/Message` 编码函数（复用已删除的发帖 protobuf 辅助函数模式）
+  - [x] SubTask 1.2: 新增 `pbpReadVarint` 和 `pbpReadString/Int32/Int64` + `pbpIterate` 解码辅助函数（用于解析 PbPage 响应）
+- [x] Task 2: 新增 `weltolkPbPageRequest` 函数
+  - [x] SubTask 2.1: 按 CommonReq + DataReq 字段编号编码 protobuf 请求体（kz=tid, pn, rn, with_floor=1, floor_rn=3, lz=0, r=0, back=0, mark=0, st_type=tb_frslist, scr_w, scr_h）
+  - [x] SubTask 2.2: 包装成 PbPageReqIdl{data=1}，用 multipart/form-data 提交（boundary, data 字段放二进制），POST 到 `https://tiebac.baidu.com/c/f/pb/page`，Header `x_bd_data_type: protobuf`、`User-Agent: bdtb for Android 12.41.7.1`、Cookie `BDUSS`
+  - [x] SubTask 2.3: 用 `autoreplyDoWithRetry` 重试，返回响应二进制（支持 gzip 解压）
+- [x] Task 3: 新增 `weltolkPbPageParse` 函数
+  - [x] SubTask 3.1: 解析 PbPageResIdl（error=1, data=2），从 error 取 errorno/errmsg
+  - [x] SubTask 3.2: 从 data 解析 page.total_page、thread.reply_num、post_list[]
+  - [x] SubTask 3.3: 每个 Post 解析 id/floor/author_id/author(name_show+portrait)/content[](拼接 text)/sub_post_list
+  - [x] SubTask 3.4: 返回结构化结果（errorno, errmsg, replyCount, totalPage, floors）
+- [x] Task 4: 重写 `weltolkGetReplyCount`
+  - [x] SubTask 4.1: 改用 `weltolkPbPageRequest`(pn=1, rn=30) + `weltolkPbPageParse`，返回 `(replyCount, totalPage, ok)`（rn=30 见 Task 9）
+- [x] Task 5: 重写 `weltolkGetLastFloorContent`
+  - [x] SubTask 5.1: 改用 `weltolkPbPageRequest`(pn=totalPage, rn=30) + `weltolkPbPageParse`
+  - [x] SubTask 5.2: post_list 按楼层升序，反转结果使 [0] 为最新楼层（调用方依赖 latestFloors[0]）
+- [x] Task 6: 删除 `weltolkCallTiebaJSONAPI`，清理无用 import
+  - [x] SubTask 6.1: 删除 `weltolkCallTiebaJSONAPI` 函数
+  - [x] SubTask 6.2: 检查并删除仅被它使用的 import（math 已移除）
+- [x] Task 7: 编译验证
+  - [x] SubTask 7.1: `go build ./...` 通过
+  - [x] SubTask 7.2: `go vet ./plugins/...` 通过
+- [x] Task 8: 修复 DataReq 缺失 CommonReq（验证阶段发现）
+  - [x] SubTask 8.1: 在 `weltolkPbPageRequest` 中编码 CommonReq 消息并作为 DataReq 字段 25 提交。CommonReq 字段：_client_type=2(字段1,int32)、_client_version="12.41.7.1"(字段2,string)、_phone_imei="000000000000000"(字段5,string)、cuid=生成串(字段7,string)、_timestamp=当前毫秒(字段8,int64)、model="2201123C"(字段9,string)、BDUSS=用户bduss(字段10,string)。依据：极速版 `n.a(builder,true,false,true)` 与 `DataReq.java` 的 `@ProtoField(tag=25) CommonReq common`
+  - [x] SubTask 8.2: 保留 Cookie 中的 BDUSS（双保险），同时确认 multipart 提交与 `x_bd_data_type: protobuf` 头不变
+- [x] Task 9: 修复 total_page 与 rn 不一致（验证阶段发现）
+  - [x] SubTask 9.1: 将 `weltolkGetReplyCount` 的请求 rn 从 1 改为 30，使返回的 total_page 基于与 `weltolkGetLastFloorContent` 相同的 rn，避免 pn=totalPage 越界返回空导致"获取楼层内容失败"。依据：Page.proto 含 page_size 字段，total_page 按请求 rn 计算
+
+# Task Dependencies
+- Task 2 depends on Task 1
+- Task 3 depends on Task 1
+- Task 4 depends on Task 2, 3
+- Task 5 depends on Task 2, 3
+- Task 6 depends on Task 4, 5
+- Task 7 depends on Task 6
+- Task 8 depends on Task 7
+- Task 9 depends on Task 8

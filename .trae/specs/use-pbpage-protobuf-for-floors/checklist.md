@@ -1,0 +1,12 @@
+# Checklist
+- [x] 新增 protobuf 编解码辅助函数（encode + read）
+- [x] `weltolkPbPageRequest` 按 CommonReq+DataReq 编码 protobuf，multipart 提交到 `https://tiebac.baidu.com/c/f/pb/page`，带 `x_bd_data_type: protobuf`
+- [x] `weltolkPbPageParse` 解析 PbPageResIdl，提取 errorno/errmsg/replyCount/totalPage/post_list
+- [x] Post 解析包含：id, floor, author_id, author(name_show+portrait), content(拼接 text), sub_post_list
+- [x] `weltolkGetReplyCount` 改用 protobuf 接口，返回 reply_num 和 total_page
+- [x] `weltolkGetLastFloorContent` 改用 protobuf 接口，pn=totalPage, rn=30，取最新楼层
+- [x] 删除 `weltolkCallTiebaJSONAPI`
+- [x] `/tmp/tbsign_backend` 执行 `go build ./...` 通过
+- [x] `/tmp/tbsign_backend` 执行 `go vet ./plugins/...` 通过
+- [x] DataReq 包含 CommonReq（字段25），含 BDUSS/_client_type/_client_version/_phone_imei/cuid/_timestamp/model（依据极速版 DataReq.java @ProtoField(tag=25) 与 n.a()）
+- [x] `weltolkGetReplyCount` 使用 rn=30，使 total_page 与 `weltolkGetLastFloorContent` 的 rn 一致，避免 pn 越界
